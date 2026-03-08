@@ -1,0 +1,51 @@
+# .gitignore
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Build
+dist/
+build/
+out/
+
+# Misc
+*.log
+*.tmp
+*.swp
+*.bak
+
+#ABCI log files
+*.e[0-9]*
+*.o[0-9]*
+
+#external
+deps/
+body_models/
+human_body_prior/
+vposer/
+
+#output files
+experiments/
+bandai_out_id_var/
+runs/
