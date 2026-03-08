@@ -44,6 +44,7 @@ deps/
 body_models/
 human_body_prior/
 vposer/
+configs/
 
 #output files
 experiments/
