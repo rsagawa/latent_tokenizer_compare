@@ -15,10 +15,12 @@ try:
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
     HAS_MATPLOTLIB = True
 except ModuleNotFoundError:
     plt = None
+    Line2D = None
     HAS_MATPLOTLIB = False
 
 
@@ -732,6 +734,479 @@ def write_base_metrics_csv(
                 }
             )
     write_csv(out_path, rows)
+
+
+def _build_sample_id_sets(
+    sample_rows: List[Dict[str, str]],
+    mode: str,
+    sample_top_k_ids: int,
+    sample_top_p: float,
+) -> List[Dict[str, object]]:
+    by_sample: Dict[str, List[Dict[str, str]]] = {}
+    for r in sample_rows:
+        mid = str(r.get("mid", "")).strip()
+        if not mid:
+            continue
+        by_sample.setdefault(mid, []).append(r)
+
+    use_top_p = 0.0 < float(sample_top_p) < 1.0
+    out_rows: List[Dict[str, object]] = []
+
+    def _build_scored(rows: List[Dict[str, str]]) -> List[Tuple[int, str, str, float]]:
+        scored: List[Tuple[int, str, str, float]] = []
+        for r in rows:
+            iid = int(_to_float(r.get("item_id"), 0.0))
+            w = _to_float(r.get("abs_attr_norm"), abs(_to_float(r.get("signed_attr_norm"), 0.0)))
+            if w <= 0.0:
+                continue
+            verb, adj = _extract_verb_adj_from_row(r)
+            scored.append((iid, verb, adj, w))
+        return sorted(scored, key=lambda x: (-x[3], x[0]))
+
+    def _apply_top_p(scored: List[Tuple[int, str, str, float]]) -> List[Tuple[int, str, str, float]]:
+        if not use_top_p:
+            return list(scored)
+        p = min(1.0, max(1e-8, float(sample_top_p)))
+        cum = 0.0
+        selected: List[Tuple[int, str, str, float]] = []
+        for t in scored:
+            selected.append(t)
+            cum += float(t[3])
+            if cum >= p:
+                break
+        return selected
+
+    for mid, rows in by_sample.items():
+        scored = _build_scored(rows)
+        if not scored:
+            continue
+        scored = _apply_top_p(scored)
+        if str(mode).strip() == "sample_topk_count" and int(sample_top_k_ids) > 0:
+            scored = scored[: int(sample_top_k_ids)]
+        ids = sorted({int(t[0]) for t in scored})
+        if not ids:
+            continue
+        verb, adj = _extract_verb_adj_from_row(rows[0])
+        out_rows.append(
+            {
+                "mid": mid,
+                "verb": verb,
+                "adjective": adj,
+                "n_ids": len(ids),
+                "selected_ids_json": json.dumps(ids, ensure_ascii=False),
+            }
+        )
+    return out_rows
+
+
+def _mean_pairwise_jaccard(id_sets: List[set]) -> float:
+    if len(id_sets) <= 1:
+        return 1.0 if id_sets else float("nan")
+    vals: List[float] = []
+    for i in range(len(id_sets)):
+        for j in range(i + 1, len(id_sets)):
+            a = id_sets[i]
+            b = id_sets[j]
+            denom = len(a | b)
+            vals.append((len(a & b) / denom) if denom > 0 else 0.0)
+    return (sum(vals) / len(vals)) if vals else float("nan")
+
+
+def _extract_conditional_id_set_motifs(
+    sample_set_rows: List[Dict[str, object]],
+    context_key: str,
+    target_key: str,
+    min_support: float,
+    min_samples: int,
+    top_k_ids: int,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    grouped: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
+    by_context: Dict[str, List[Dict[str, object]]] = {}
+    for r in sample_set_rows:
+        context = str(r.get(context_key, "")).strip()
+        target = str(r.get(target_key, "")).strip()
+        if not context or not target:
+            continue
+        grouped.setdefault((context, target), []).append(r)
+        by_context.setdefault(context, []).append(r)
+
+    summary_rows: List[Dict[str, object]] = []
+    item_rows: List[Dict[str, object]] = []
+
+    for (context, target), rows in sorted(grouped.items()):
+        if len(rows) < int(min_samples):
+            continue
+        cond_sets = [set(json.loads(str(r.get("selected_ids_json", "[]")))) for r in rows]
+        cond_sets = [s for s in cond_sets if s]
+        if len(cond_sets) < int(min_samples):
+            continue
+        other_rows = [r for r in by_context.get(context, []) if str(r.get(target_key, "")).strip() != target]
+        other_sets = [set(json.loads(str(r.get("selected_ids_json", "[]")))) for r in other_rows]
+        other_sets = [s for s in other_sets if s]
+
+        cond_counts: Dict[int, int] = {}
+        other_counts: Dict[int, int] = {}
+        for s in cond_sets:
+            for iid in s:
+                cond_counts[int(iid)] = cond_counts.get(int(iid), 0) + 1
+        for s in other_sets:
+            for iid in s:
+                other_counts[int(iid)] = other_counts.get(int(iid), 0) + 1
+
+        denom_cond = float(len(cond_sets))
+        denom_other = float(len(other_sets))
+        candidates: List[Dict[str, object]] = []
+        for iid in sorted(set(cond_counts.keys()) | set(other_counts.keys())):
+            support_cond = cond_counts.get(iid, 0) / denom_cond if denom_cond > 0 else 0.0
+            support_other = other_counts.get(iid, 0) / denom_other if denom_other > 0 else 0.0
+            support_diff = support_cond - support_other
+            support_lift = (support_cond / support_other) if support_other > 0 else (float("inf") if support_cond > 0 else float("nan"))
+            motif_score = max(0.0, support_diff) * support_cond
+            candidates.append({
+                "context_label": context,
+                "target_label": target,
+                "item_id": int(iid),
+                "support_cond": support_cond,
+                "support_other": support_other,
+                "support_diff_vs_other": support_diff,
+                "support_lift_vs_other": support_lift,
+                "motif_score": motif_score,
+            })
+
+        selected = [
+            r for r in candidates
+            if float(r["support_cond"]) >= float(min_support) and float(r["support_diff_vs_other"]) > 0.0
+        ]
+        selected.sort(key=lambda r: (-float(r["motif_score"]), -float(r["support_diff_vs_other"]), -float(r["support_cond"]), int(r["item_id"])))
+        if int(top_k_ids) > 0:
+            selected = selected[: int(top_k_ids)]
+
+        rep_ids = [int(r["item_id"]) for r in selected]
+        summary_rows.append({
+            "context_label": context,
+            "target_label": target,
+            "n_samples": len(cond_sets),
+            "n_other_samples_same_context": len(other_sets),
+            "group_mean_pairwise_jaccard": _mean_pairwise_jaccard(cond_sets),
+            "n_motif_ids": len(rep_ids),
+            "motif_ids_json": json.dumps(rep_ids, ensure_ascii=False),
+        })
+        for rank, row in enumerate(selected, start=1):
+            rr = dict(row)
+            rr["rank"] = rank
+            item_rows.append(rr)
+
+    return summary_rows, item_rows
+
+
+def export_conditional_id_set_motifs(
+    task: str,
+    names: List[str],
+    attr_sample_rows_by_model: Dict[str, List[Dict[str, str]]],
+    attr_sample_aggregation_mode: str,
+    sample_top_k_ids: int,
+    sample_top_p: float,
+    motif_min_support: float,
+    motif_min_samples: int,
+    motif_top_k_ids: int,
+    out_dir: Path,
+) -> None:
+    summary_rows: List[Dict[str, object]] = []
+    item_rows: List[Dict[str, object]] = []
+    sample_set_rows_out: List[Dict[str, object]] = []
+
+    for model in names:
+        sample_rows = attr_sample_rows_by_model.get(model, [])
+        if not sample_rows:
+            continue
+        sample_set_rows = _build_sample_id_sets(
+            sample_rows,
+            attr_sample_aggregation_mode,
+            sample_top_k_ids,
+            sample_top_p,
+        )
+        for row in sample_set_rows:
+            rr = dict(row)
+            rr["task"] = task
+            rr["tokenizer"] = model
+            sample_set_rows_out.append(rr)
+        for motif_mode, context_key, target_key in [
+            ("adj_given_verb", "verb", "adjective"),
+            ("verb_given_adj", "adjective", "verb"),
+        ]:
+            s_rows, i_rows = _extract_conditional_id_set_motifs(
+                sample_set_rows,
+                context_key,
+                target_key,
+                motif_min_support,
+                motif_min_samples,
+                motif_top_k_ids,
+            )
+            for row in s_rows:
+                rr = dict(row)
+                rr["task"] = task
+                rr["tokenizer"] = model
+                rr["motif_mode"] = motif_mode
+                summary_rows.append(rr)
+            for row in i_rows:
+                rr = dict(row)
+                rr["task"] = task
+                rr["tokenizer"] = model
+                rr["motif_mode"] = motif_mode
+                item_rows.append(rr)
+
+    write_csv(out_dir / f"{task}_conditional_id_set_motif_summary.csv", summary_rows)
+    write_csv(out_dir / f"{task}_conditional_id_set_motif_items.csv", item_rows)
+    write_csv(out_dir / f"{task}_conditional_id_set_sample_sets.csv", sample_set_rows_out)
+
+
+def plot_conditional_id_set_support_bars(
+    task: str,
+    names: List[str],
+    out_dir: Path,
+    max_ids_per_group: int = 20,
+) -> None:
+    summary_path = out_dir / f"{task}_conditional_id_set_motif_summary.csv"
+    sample_sets_path = out_dir / f"{task}_conditional_id_set_sample_sets.csv"
+    if not summary_path.exists() or not sample_sets_path.exists():
+        print(f"[warn] missing conditional motif CSVs for support scatter: task={task}")
+        return
+
+    summary_rows = _load_csv_rows(summary_path)
+    sample_set_rows = _load_csv_rows(sample_sets_path)
+    if not summary_rows or not sample_set_rows:
+        print(f"[warn] no conditional motif rows for support scatter: task={task}")
+        return
+
+    by_model: Dict[str, List[Dict[str, str]]] = {}
+    for r in sample_set_rows:
+        model = str(r.get("tokenizer", "")).strip()
+        if not model:
+            continue
+        by_model.setdefault(model, []).append(r)
+
+    def _parse_id_set(s: str) -> set:
+        try:
+            vals = json.loads(str(s))
+            return {int(v) for v in vals}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return set()
+
+    def _compute_set_support(subset: set, sets: List[set]) -> float:
+        if not sets:
+            return 0.0
+        n = 0
+        for ss in sets:
+            if subset.issubset(ss):
+                n += 1
+        return n / float(len(sets))
+
+    def _greedy_max_diff(candidates: set, cond_sets: List[set], other_sets: List[set]) -> Tuple[set, float, float]:
+        if not candidates:
+            return set(), 0.0, 0.0
+
+        def _score(subset: set) -> Tuple[float, float, float]:
+            s_cond = _compute_set_support(subset, cond_sets)
+            s_other = _compute_set_support(subset, other_sets)
+            return s_cond - s_other, s_cond, s_other
+
+        cand_sorted = sorted(int(i) for i in candidates)
+        # Start from the best single ID.
+        best_subset: set = {cand_sorted[0]}
+        best_diff, best_cond, best_other = _score(best_subset)
+        for iid in cand_sorted[1:]:
+            d, c, o = _score({iid})
+            if (d > best_diff) or (abs(d - best_diff) <= 1e-12 and (c > best_cond or (abs(c - best_cond) <= 1e-12 and iid < min(best_subset)))):
+                best_subset = {iid}
+                best_diff, best_cond, best_other = d, c, o
+
+        # Forward greedy add if it improves diff.
+        improved = True
+        while improved:
+            improved = False
+            remain = [iid for iid in cand_sorted if iid not in best_subset]
+            pick_iid = None
+            pick_diff = best_diff
+            pick_cond = best_cond
+            pick_other = best_other
+            for iid in remain:
+                trial = set(best_subset)
+                trial.add(iid)
+                d, c, o = _score(trial)
+                if (d > pick_diff + 1e-12) or (
+                    abs(d - pick_diff) <= 1e-12 and (c > pick_cond + 1e-12 or (abs(c - pick_cond) <= 1e-12 and iid < (pick_iid if pick_iid is not None else 10**18)))
+                ):
+                    pick_iid = iid
+                    pick_diff = d
+                    pick_cond = c
+                    pick_other = o
+            if pick_iid is not None:
+                best_subset.add(pick_iid)
+                best_diff = pick_diff
+                best_cond = pick_cond
+                best_other = pick_other
+                improved = True
+
+        return best_subset, best_cond, best_other
+
+    point_rows: List[Dict[str, object]] = []
+    mode_to_keys = {
+        "adj_given_verb": ("verb", "adjective"),
+        "verb_given_adj": ("adjective", "verb"),
+    }
+    for r in summary_rows:
+        model = str(r.get("tokenizer", "")).strip()
+        mode = str(r.get("motif_mode", "")).strip()
+        context = str(r.get("context_label", "")).strip()
+        target = str(r.get("target_label", "")).strip()
+        if not model or model not in names or mode not in mode_to_keys or not context or not target:
+            continue
+        candidate_ids = _parse_id_set(str(r.get("motif_ids_json", "[]")))
+        if not candidate_ids:
+            continue
+        context_key, target_key = mode_to_keys[mode]
+        sample_rows_model = by_model.get(model, [])
+        cond_rows = [
+            rr for rr in sample_rows_model
+            if str(rr.get(context_key, "")).strip() == context and str(rr.get(target_key, "")).strip() == target
+        ]
+        other_rows = [
+            rr for rr in sample_rows_model
+            if str(rr.get(context_key, "")).strip() == context and str(rr.get(target_key, "")).strip() != target
+        ]
+        if not cond_rows:
+            continue
+
+        cond_sets = [_parse_id_set(str(rr.get("selected_ids_json", "[]"))) for rr in cond_rows]
+        other_sets = [_parse_id_set(str(rr.get("selected_ids_json", "[]"))) for rr in other_rows]
+        motif_ids, support_cond_set, support_other_set = _greedy_max_diff(candidate_ids, cond_sets, other_sets)
+        if not motif_ids:
+            continue
+        point_rows.append(
+            {
+                "task": task,
+                "tokenizer": model,
+                "motif_mode": mode,
+                "context_label": context,
+                "target_label": target,
+                "n_candidate_ids": len(candidate_ids),
+                "n_motif_ids": len(motif_ids),
+                "motif_ids_json": json.dumps(sorted(motif_ids), ensure_ascii=False),
+                "n_cond_rows": len(cond_sets),
+                "n_other_rows": len(other_sets),
+                "set_support_cond": support_cond_set,
+                "set_support_other": support_other_set,
+                "set_support_diff": support_cond_set - support_other_set,
+            }
+        )
+
+    write_csv(out_dir / f"{task}_conditional_id_set_motif_set_support_points.csv", point_rows)
+    if not point_rows:
+        print(f"[warn] no valid motif-id sets for support scatter: task={task}")
+        return
+    if not HAS_MATPLOTLIB:
+        print(f"[warn] matplotlib not found: skip conditional motif support scatter PNG ({task})")
+        return
+
+    for mode in ("adj_given_verb", "verb_given_adj"):
+        rows_mode = [r for r in point_rows if str(r.get("motif_mode", "")) == mode]
+        if not rows_mode:
+            continue
+        for model in names:
+            rows_model = [r for r in rows_mode if str(r.get("tokenizer", "")) == model]
+            if not rows_model:
+                continue
+            fig, ax = plt.subplots(1, 1, figsize=(8.0, 7.0), constrained_layout=True)
+            if mode == "adj_given_verb":
+                color_label_name = "verb"
+                marker_label_name = "adjective"
+            else:
+                color_label_name = "adjective"
+                marker_label_name = "verb"
+            color_values = sorted({str(r.get("context_label", "")).strip() for r in rows_model})
+            marker_values = sorted({str(r.get("target_label", "")).strip() for r in rows_model})
+            cmap = plt.get_cmap("tab20")
+            color_by_value = {lb: cmap(i % 20) for i, lb in enumerate(color_values)}
+            color_idx_by_value = {lb: i for i, lb in enumerate(color_values)}
+            markers = ["o", "s", "^", "D", "P", "X", "v", "<", ">", "*", "h", "8"]
+            marker_by_value = {lb: markers[i % len(markers)] for i, lb in enumerate(marker_values)}
+            marker_idx_by_value = {lb: i for i, lb in enumerate(marker_values)}
+            for row in rows_model:
+                x = _to_float(row.get("set_support_other"), 0.0)
+                y = _to_float(row.get("set_support_cond"), 0.0)
+                color_value = str(row.get("context_label", "")).strip()
+                marker_value = str(row.get("target_label", "")).strip()
+                # Small deterministic jitter to avoid exact overlap.
+                dx = ((color_idx_by_value.get(color_value, 0) % 7) - 3) * 0.0025
+                dy = ((marker_idx_by_value.get(marker_value, 0) % 7) - 3) * 0.0025
+                x_plot = min(1.0, max(0.0, x + dx))
+                y_plot = min(1.0, max(0.0, y + dy))
+                ax.scatter(
+                    [x_plot],
+                    [y_plot],
+                    s=30 + 6 * max(1.0, _to_float(row.get("n_motif_ids"), 1.0)),
+                    marker=marker_by_value.get(marker_value, "o"),
+                    color=color_by_value.get(color_value, "#4C78A8"),
+                    alpha=0.8,
+                    edgecolors="none",
+                )
+
+            ax.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", linewidth=1.0, color="#666666", alpha=0.8)
+            ax.set_xlim(-0.02, 1.02)
+            ax.set_ylim(-0.02, 1.02)
+            ax.set_xlabel("set_support_other")
+            ax.set_ylabel("set_support_cond")
+            ax.set_title(f"{task} | {model} | {mode} | Motif ID-set support")
+            ax.grid(alpha=0.25)
+
+            color_handles = [
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="none",
+                    markerfacecolor=color_by_value[lb],
+                    markersize=7,
+                    label=lb,
+                )
+                for lb in color_values
+            ]
+            marker_handles = [
+                Line2D(
+                    [0],
+                    [0],
+                    marker=marker_by_value[lb],
+                    color="#444444",
+                    linestyle="none",
+                    markersize=7,
+                    label=lb,
+                )
+                for lb in marker_values
+            ]
+            leg1 = ax.legend(
+                handles=color_handles,
+                title=f"Color -> {color_label_name}",
+                loc="upper left",
+                bbox_to_anchor=(1.02, 1.0),
+                fontsize=7,
+                title_fontsize=8,
+                frameon=True,
+            )
+            ax.add_artist(leg1)
+            ax.legend(
+                handles=marker_handles,
+                title=f"Marker -> {marker_label_name}",
+                loc="lower left",
+                bbox_to_anchor=(1.02, 0.0),
+                fontsize=7,
+                title_fontsize=8,
+                frameon=True,
+            )
+            fig.savefig(
+                out_dir / f"{task}_{_sanitize_name(model)}_conditional_id_set_motif_set_support_scatter_{mode}.png",
+                dpi=180,
+            )
+            plt.close(fig)
 
 
 def _group_rows_by_class(rows: List[Dict[str, str]]) -> Dict[str, List[Dict[str, str]]]:
@@ -2014,6 +2489,9 @@ def main() -> None:
         help="If 0 or >=1, disabled. If 0<p<1, apply per-sample cumulative top-p filtering.",
     )
     ap.add_argument("--bias_strength_bin_width", type=float, default=0.1)
+    ap.add_argument("--motif_min_support", type=float, default=0.35)
+    ap.add_argument("--motif_min_samples", type=int, default=3)
+    ap.add_argument("--motif_top_k_ids", type=int, default=8)
     args = ap.parse_args()
 
     base_dir = Path(args.base_dir)
@@ -2163,6 +2641,32 @@ def main() -> None:
     )
     export_role_disentanglement_comparison("actionrec", args.names, action_bias_rows, out_dir)
     export_role_disentanglement_comparison("retrieval", args.names, retrieval_bias_rows, out_dir)
+    export_conditional_id_set_motifs(
+        "actionrec",
+        args.names,
+        attr_sample_rows["actionrec"],
+        args.attr_sample_aggregation_mode,
+        args.sample_top_k_ids,
+        args.sample_top_p,
+        args.motif_min_support,
+        args.motif_min_samples,
+        args.motif_top_k_ids,
+        out_dir,
+    )
+    export_conditional_id_set_motifs(
+        "retrieval",
+        args.names,
+        attr_sample_rows["retrieval"],
+        args.attr_sample_aggregation_mode,
+        args.sample_top_k_ids,
+        args.sample_top_p,
+        args.motif_min_support,
+        args.motif_min_samples,
+        args.motif_top_k_ids,
+        out_dir,
+    )
+    plot_conditional_id_set_support_bars("actionrec", args.names, out_dir)
+    plot_conditional_id_set_support_bars("retrieval", args.names, out_dir)
     use_attr = has_attr_action
     plot_label_id_bias_maps_per_model(
         "actionrec",
