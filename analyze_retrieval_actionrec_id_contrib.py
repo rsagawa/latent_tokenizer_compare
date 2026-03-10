@@ -10,6 +10,10 @@ Evaluate token-ID contributions for actionrec/retrieval by:
    - PMI
    - chi-square (one-vs-rest, 2x2)
    - mutual information (binary item-presence vs class)
+3) sequence motif mining:
+   - extract high-contribution contiguous ID subsequences per sample
+   - validate motif importance with per-sample perturbation
+   - summarize recurring motifs across samples
 """
 
 from __future__ import annotations
@@ -1034,6 +1038,226 @@ def _perturb_samples_by_global_id_drop(
     }
 
 
+def _perturb_samples_by_global_motif_drop(
+    samples: Sequence[Sample],
+    motif: Sequence[int],
+    drop_all_occurrences: bool,
+) -> Tuple[List[Sample], Dict[str, float]]:
+    out: List[Sample] = []
+    total_tokens = 0
+    removed_tokens = 0
+    affected_samples = 0
+    fallback_kept_original = 0
+    samples_with_motif = 0
+    total_matched_occurrences = 0
+    motif_list = [int(x) for x in motif]
+
+    for s in samples:
+        original = list(s.token_ids)
+        total_tokens += len(original)
+        occ_pos = _find_subsequence_occurrences(original, motif_list)
+        if occ_pos:
+            samples_with_motif += 1
+        new_tokens, n_removed_occ = _drop_motif_occurrences(
+            original,
+            motif_list,
+            drop_all_occurrences=bool(drop_all_occurrences),
+        )
+        total_matched_occurrences += int(n_removed_occ)
+        if len(new_tokens) != len(original):
+            affected_samples += 1
+        if not new_tokens:
+            new_tokens = list(original[:1]) if original else [0]
+            fallback_kept_original += 1
+        removed_tokens += max(0, len(original) - len(new_tokens))
+        out.append(Sample(mid=s.mid, token_ids=new_tokens, label=s.label, text_tokens=list(s.text_tokens)))
+
+    return out, {
+        "n_samples": len(samples),
+        "motif_len": len(motif_list),
+        "motif_key": _motif_to_key(motif_list),
+        "samples_with_motif": samples_with_motif,
+        "total_matched_occurrences": total_matched_occurrences,
+        "affected_sample_ratio": _safe_ratio(float(affected_samples), float(max(1, len(samples)))),
+        "removed_token_ratio": _safe_ratio(float(removed_tokens), float(max(1, total_tokens))),
+        "n_fallback_kept_original": fallback_kept_original,
+    }
+
+
+def _drop_multiple_motif_occurrences(
+    token_ids: Sequence[int],
+    motifs: Sequence[Sequence[int]],
+    drop_all_occurrences: bool,
+) -> Tuple[List[int], int]:
+    seq = [int(x) for x in token_ids]
+    total_removed_occ = 0
+    ordered = sorted(
+        ([int(t) for t in m] for m in motifs if len(m) > 0),
+        key=lambda m: (-len(m), tuple(m)),
+    )
+    for motif in ordered:
+        seq, n_removed = _drop_motif_occurrences(seq, motif, drop_all_occurrences=drop_all_occurrences)
+        total_removed_occ += int(n_removed)
+    return seq, total_removed_occ
+
+
+def _perturb_samples_by_global_motif_set_drop(
+    samples: Sequence[Sample],
+    motifs: Sequence[Sequence[int]],
+    drop_all_occurrences: bool,
+) -> Tuple[List[Sample], Dict[str, float]]:
+    out: List[Sample] = []
+    total_tokens = 0
+    removed_tokens = 0
+    affected_samples = 0
+    fallback_kept_original = 0
+    samples_with_any_motif = 0
+    total_matched_occurrences = 0
+    motif_list = [[int(t) for t in m] for m in motifs if len(m) > 0]
+
+    for s in samples:
+        original = list(s.token_ids)
+        total_tokens += len(original)
+        has_any = False
+        for m in motif_list:
+            if _find_subsequence_occurrences(original, m):
+                has_any = True
+                break
+        if has_any:
+            samples_with_any_motif += 1
+
+        new_tokens, n_removed_occ = _drop_multiple_motif_occurrences(
+            original,
+            motif_list,
+            drop_all_occurrences=bool(drop_all_occurrences),
+        )
+        total_matched_occurrences += int(n_removed_occ)
+        if len(new_tokens) != len(original):
+            affected_samples += 1
+        if not new_tokens:
+            new_tokens = list(original[:1]) if original else [0]
+            fallback_kept_original += 1
+        removed_tokens += max(0, len(original) - len(new_tokens))
+        out.append(Sample(mid=s.mid, token_ids=new_tokens, label=s.label, text_tokens=list(s.text_tokens)))
+
+    return out, {
+        "n_samples": len(samples),
+        "n_motifs_in_set": len(motif_list),
+        "samples_with_any_motif": samples_with_any_motif,
+        "total_matched_occurrences": total_matched_occurrences,
+        "affected_sample_ratio": _safe_ratio(float(affected_samples), float(max(1, len(samples)))),
+        "removed_token_ratio": _safe_ratio(float(removed_tokens), float(max(1, total_tokens))),
+        "n_fallback_kept_original": fallback_kept_original,
+    }
+
+
+def _find_motif_occurrences_spans(token_ids: Sequence[int], motif: Sequence[int]) -> List[Tuple[int, int]]:
+    pos = _find_subsequence_occurrences(token_ids, motif)
+    m = len(motif)
+    return [(int(st), int(st + m)) for st in pos]
+
+
+def _find_ordered_motif_chain_occurrences(
+    token_ids: Sequence[int],
+    motifs: Sequence[Sequence[int]],
+    min_gap: int,
+    max_gap: int,
+    max_matches: int = 1000,
+) -> List[List[Tuple[int, int]]]:
+    motif_spans = [_find_motif_occurrences_spans(token_ids, m) for m in motifs]
+    if not motif_spans or any(len(sps) == 0 for sps in motif_spans):
+        return []
+    lo = max(0, int(min_gap))
+    hi = max(lo, int(max_gap))
+    out: List[List[Tuple[int, int]]] = []
+
+    def _dfs(level: int, prev_span: Optional[Tuple[int, int]], path: List[Tuple[int, int]]) -> None:
+        if len(out) >= int(max_matches):
+            return
+        if level >= len(motif_spans):
+            out.append(list(path))
+            return
+        for sp in motif_spans[level]:
+            st, ed = sp
+            if prev_span is not None:
+                p_st, p_ed = prev_span
+                gap = int(st - p_ed)
+                if st < p_ed:
+                    continue
+                if gap < lo or gap > hi:
+                    continue
+                if st < p_st:
+                    continue
+            path.append((int(st), int(ed)))
+            _dfs(level + 1, (int(st), int(ed)), path)
+            path.pop()
+
+    _dfs(0, None, [])
+    return out
+
+
+def _perturb_samples_by_global_motif_chain_drop(
+    samples: Sequence[Sample],
+    motifs: Sequence[Sequence[int]],
+    min_gap: int,
+    max_gap: int,
+    drop_all_occurrences: bool,
+) -> Tuple[List[Sample], Dict[str, float]]:
+    out: List[Sample] = []
+    total_tokens = 0
+    removed_tokens = 0
+    affected_samples = 0
+    fallback_kept_original = 0
+    samples_with_chain = 0
+    total_matched_chains = 0
+    chain_motifs = [[int(x) for x in m] for m in motifs if len(m) > 0]
+    chain_keys = [_motif_to_key(m) for m in chain_motifs]
+
+    for s in samples:
+        original = list(s.token_ids)
+        total_tokens += len(original)
+        chains = _find_ordered_motif_chain_occurrences(
+            original,
+            chain_motifs,
+            min_gap=int(min_gap),
+            max_gap=int(max_gap),
+        )
+        if chains:
+            samples_with_chain += 1
+        if not chains:
+            new_tokens = list(original)
+        else:
+            chains_to_use = chains if bool(drop_all_occurrences) else chains[:1]
+            total_matched_chains += len(chains_to_use)
+            drop_idx: Set[int] = set()
+            for chain in chains_to_use:
+                for st, ed in chain:
+                    for i in range(st, ed):
+                        drop_idx.add(int(i))
+            new_tokens = [int(t) for i, t in enumerate(original) if i not in drop_idx]
+
+        if len(new_tokens) != len(original):
+            affected_samples += 1
+        if not new_tokens:
+            new_tokens = list(original[:1]) if original else [0]
+            fallback_kept_original += 1
+        removed_tokens += max(0, len(original) - len(new_tokens))
+        out.append(Sample(mid=s.mid, token_ids=new_tokens, label=s.label, text_tokens=list(s.text_tokens)))
+
+    return out, {
+        "n_samples": len(samples),
+        "chain_size": len(chain_motifs),
+        "chain_keys": " -> ".join(chain_keys),
+        "chain_min_gap": int(min_gap),
+        "chain_max_gap": int(max_gap),
+        "samples_with_chain": samples_with_chain,
+        "total_matched_chains": total_matched_chains,
+        "affected_sample_ratio": _safe_ratio(float(affected_samples), float(max(1, len(samples)))),
+        "removed_token_ratio": _safe_ratio(float(removed_tokens), float(max(1, total_tokens))),
+        "n_fallback_kept_original": fallback_kept_original,
+    }
+
+
 def compute_attr_coverage_rows(
     per_sample_rows: Sequence[Dict[str, object]],
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
@@ -1204,6 +1428,220 @@ def compute_retrieval_id_perturbation(
     return rows
 
 
+def compute_actionrec_motif_perturbation(
+    model: ar.ActionClassifier,
+    samples: Sequence[Sample],
+    vocab_size: int,
+    max_tokens: int,
+    batch_size: int,
+    device: torch.device,
+    n_classes: int,
+    base_metrics: Dict[str, float],
+    motif_rows: Sequence[Dict[str, object]],
+    top_k_motifs: int,
+    drop_all_occurrences: bool,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    candidates = list(motif_rows[: max(0, int(top_k_motifs))]) if int(top_k_motifs) > 0 else list(motif_rows)
+    for rank, mrow in enumerate(candidates, start=1):
+        motif_seq = [int(x) for x in str(mrow.get("motif_id_sequence", "")).split() if str(x).strip()]
+        if not motif_seq:
+            continue
+        pert_samples, pstats = _perturb_samples_by_global_motif_drop(
+            samples=samples,
+            motif=motif_seq,
+            drop_all_occurrences=bool(drop_all_occurrences),
+        )
+        pert_metrics = eval_actionrec_samples(
+            model=model,
+            samples=pert_samples,
+            vocab_size=vocab_size,
+            max_tokens=max_tokens,
+            batch_size=batch_size,
+            device=device,
+            n_classes=n_classes,
+        )
+        delta = _summarize_action_delta(base_metrics, pert_metrics)
+        rows.append({
+            "rank": rank,
+            "motif_key": str(mrow.get("motif_key", _motif_to_key(motif_seq))),
+            "motif_id_sequence": str(mrow.get("motif_id_sequence", _motif_to_key(motif_seq))),
+            "motif_len": int(mrow.get("motif_len", len(motif_seq))),
+            "support_samples": int(mrow.get("support_samples", 0)),
+            "perturbation": "drop_motif_sequence_global",
+            "drop_all_occurrences": int(bool(drop_all_occurrences)),
+            "importance_score": float(delta["primary_metric_drop"]),
+            **delta,
+            **pstats,
+        })
+    return rows
+
+
+def compute_retrieval_motif_perturbation(
+    model: rt.DualEncoder,
+    samples: Sequence[Sample],
+    motiongpt_root: str,
+    vocab_size: int,
+    max_tokens: int,
+    max_text_len: int,
+    batch_size: int,
+    device: torch.device,
+    base_metrics: Dict[str, object],
+    cached_text_emb: np.ndarray,
+    motif_rows: Sequence[Dict[str, object]],
+    top_k_motifs: int,
+    drop_all_occurrences: bool,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    candidates = list(motif_rows[: max(0, int(top_k_motifs))]) if int(top_k_motifs) > 0 else list(motif_rows)
+    for rank, mrow in enumerate(candidates, start=1):
+        motif_seq = [int(x) for x in str(mrow.get("motif_id_sequence", "")).split() if str(x).strip()]
+        if not motif_seq:
+            continue
+        pert_samples, pstats = _perturb_samples_by_global_motif_drop(
+            samples=samples,
+            motif=motif_seq,
+            drop_all_occurrences=bool(drop_all_occurrences),
+        )
+        pert_metrics = evaluate_retrieval(
+            model=model,
+            samples=pert_samples,
+            motiongpt_root=motiongpt_root,
+            vocab_size=vocab_size,
+            max_tokens=max_tokens,
+            max_text_len=max_text_len,
+            batch_size=batch_size,
+            device=device,
+            cached_text_emb=cached_text_emb,
+        )
+        delta = _summarize_retrieval_delta(base_metrics, pert_metrics)
+        rows.append({
+            "rank": rank,
+            "motif_key": str(mrow.get("motif_key", _motif_to_key(motif_seq))),
+            "motif_id_sequence": str(mrow.get("motif_id_sequence", _motif_to_key(motif_seq))),
+            "motif_len": int(mrow.get("motif_len", len(motif_seq))),
+            "support_samples": int(mrow.get("support_samples", 0)),
+            "perturbation": "drop_motif_sequence_global",
+            "drop_all_occurrences": int(bool(drop_all_occurrences)),
+            "importance_score": float(delta["primary_metric_drop"]),
+            **delta,
+            **pstats,
+        })
+    return rows
+
+
+def compute_actionrec_motif_set_perturbation(
+    model: ar.ActionClassifier,
+    samples: Sequence[Sample],
+    vocab_size: int,
+    max_tokens: int,
+    batch_size: int,
+    device: torch.device,
+    n_classes: int,
+    base_metrics: Dict[str, float],
+    motif_rows: Sequence[Dict[str, object]],
+    top_k_values: Sequence[int],
+    drop_all_occurrences: bool,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    ranked = [r for r in motif_rows if str(r.get("motif_id_sequence", "")).strip()]
+    motifs = [[int(x) for x in str(r.get("motif_id_sequence", "")).split() if str(x).strip()] for r in ranked]
+    keys = [str(r.get("motif_key", _motif_to_key(m))) for r, m in zip(ranked, motifs)]
+    max_k = len(motifs)
+    if max_k <= 0:
+        return rows
+    for k in sorted(set(max(1, int(v)) for v in top_k_values if int(v) > 0)):
+        kk = min(k, max_k)
+        sel_motifs = motifs[:kk]
+        sel_keys = keys[:kk]
+        pert_samples, pstats = _perturb_samples_by_global_motif_set_drop(
+            samples=samples,
+            motifs=sel_motifs,
+            drop_all_occurrences=bool(drop_all_occurrences),
+        )
+        pert_metrics = eval_actionrec_samples(
+            model=model,
+            samples=pert_samples,
+            vocab_size=vocab_size,
+            max_tokens=max_tokens,
+            batch_size=batch_size,
+            device=device,
+            n_classes=n_classes,
+        )
+        delta = _summarize_action_delta(base_metrics, pert_metrics)
+        rows.append(
+            {
+                "set_size_k": kk,
+                "selection_mode": "top_k_global_motifs",
+                "perturbation": "drop_motif_set_global",
+                "drop_all_occurrences": int(bool(drop_all_occurrences)),
+                "selected_motif_keys": " || ".join(sel_keys),
+                "importance_score": float(delta["primary_metric_drop"]),
+                **delta,
+                **pstats,
+            }
+        )
+    return rows
+
+
+def compute_retrieval_motif_set_perturbation(
+    model: rt.DualEncoder,
+    samples: Sequence[Sample],
+    motiongpt_root: str,
+    vocab_size: int,
+    max_tokens: int,
+    max_text_len: int,
+    batch_size: int,
+    device: torch.device,
+    base_metrics: Dict[str, object],
+    cached_text_emb: np.ndarray,
+    motif_rows: Sequence[Dict[str, object]],
+    top_k_values: Sequence[int],
+    drop_all_occurrences: bool,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    ranked = [r for r in motif_rows if str(r.get("motif_id_sequence", "")).strip()]
+    motifs = [[int(x) for x in str(r.get("motif_id_sequence", "")).split() if str(x).strip()] for r in ranked]
+    keys = [str(r.get("motif_key", _motif_to_key(m))) for r, m in zip(ranked, motifs)]
+    max_k = len(motifs)
+    if max_k <= 0:
+        return rows
+    for k in sorted(set(max(1, int(v)) for v in top_k_values if int(v) > 0)):
+        kk = min(k, max_k)
+        sel_motifs = motifs[:kk]
+        sel_keys = keys[:kk]
+        pert_samples, pstats = _perturb_samples_by_global_motif_set_drop(
+            samples=samples,
+            motifs=sel_motifs,
+            drop_all_occurrences=bool(drop_all_occurrences),
+        )
+        pert_metrics = evaluate_retrieval(
+            model=model,
+            samples=pert_samples,
+            motiongpt_root=motiongpt_root,
+            vocab_size=vocab_size,
+            max_tokens=max_tokens,
+            max_text_len=max_text_len,
+            batch_size=batch_size,
+            device=device,
+            cached_text_emb=cached_text_emb,
+        )
+        delta = _summarize_retrieval_delta(base_metrics, pert_metrics)
+        rows.append(
+            {
+                "set_size_k": kk,
+                "selection_mode": "top_k_global_motifs",
+                "perturbation": "drop_motif_set_global",
+                "drop_all_occurrences": int(bool(drop_all_occurrences)),
+                "selected_motif_keys": " || ".join(sel_keys),
+                "importance_score": float(delta["primary_metric_drop"]),
+                **delta,
+                **pstats,
+            }
+        )
+    return rows
+
+
 def compute_actionrec_budget_curves(
     model: ar.ActionClassifier,
     samples: Sequence[Sample],
@@ -1330,6 +1768,709 @@ def compute_retrieval_budget_curves(
     return rows
 
 
+def _build_mid_to_id_weight_map(per_sample_rows: Sequence[Dict[str, object]]) -> Dict[str, Dict[int, float]]:
+    out: Dict[str, Dict[int, float]] = {}
+    for r in per_sample_rows:
+        mid = str(r.get("mid", "")).strip()
+        if not mid:
+            continue
+        tid = int(r.get("item_id", 0))
+        w = float(r.get("abs_attr_norm", abs(float(r.get("signed_attr_norm", 0.0)))))
+        if w <= 0.0:
+            continue
+        out.setdefault(mid, {})
+        out[mid][tid] = out[mid].get(tid, 0.0) + w
+    return out
+
+
+def _motif_to_key(motif: Sequence[int]) -> str:
+    return " ".join(str(int(t)) for t in motif)
+
+
+def _find_subsequence_occurrences(token_ids: Sequence[int], motif: Sequence[int]) -> List[int]:
+    seq = [int(x) for x in token_ids]
+    sub = [int(x) for x in motif]
+    n = len(seq)
+    m = len(sub)
+    if m <= 0 or n < m:
+        return []
+    out: List[int] = []
+    for i in range(0, n - m + 1):
+        if seq[i : i + m] == sub:
+            out.append(i)
+    return out
+
+
+def _drop_motif_occurrences(
+    token_ids: Sequence[int],
+    motif: Sequence[int],
+    drop_all_occurrences: bool,
+) -> Tuple[List[int], int]:
+    seq = [int(x) for x in token_ids]
+    sub = [int(x) for x in motif]
+    n = len(seq)
+    m = len(sub)
+    if m <= 0 or n < m:
+        return seq, 0
+    out: List[int] = []
+    i = 0
+    removed = 0
+    while i < n:
+        if i + m <= n and seq[i : i + m] == sub:
+            removed += 1
+            i += m
+            if not bool(drop_all_occurrences):
+                out.extend(seq[i:])
+                break
+            continue
+        out.append(seq[i])
+        i += 1
+    return out, removed
+
+
+def extract_sample_motifs(
+    samples: Sequence[Sample],
+    per_sample_rows: Sequence[Dict[str, object]],
+    class_names: Sequence[str],
+    min_len: int,
+    max_len: int,
+    top_k_per_sample: int,
+    min_mean_weight: float,
+) -> List[Dict[str, object]]:
+    mid_to_w = _build_mid_to_id_weight_map(per_sample_rows)
+    lo = max(1, int(min_len))
+    hi = max(lo, int(max_len))
+    rows: List[Dict[str, object]] = []
+
+    for s in samples:
+        seq = [int(t) for t in s.token_ids]
+        if len(seq) < lo:
+            continue
+        wmap = mid_to_w.get(str(s.mid), {})
+        total_weight = sum(float(wmap.get(t, 0.0)) for t in seq)
+        cand: Dict[Tuple[int, ...], Dict[str, object]] = {}
+
+        for st in range(len(seq)):
+            for L in range(lo, hi + 1):
+                ed = st + L
+                if ed > len(seq):
+                    break
+                motif = tuple(seq[st:ed])
+                token_weights = [float(wmap.get(t, 0.0)) for t in motif]
+                mass = float(sum(token_weights))
+                mean_w = float(mass / max(1, L))
+                if mass <= 0.0 or mean_w < float(min_mean_weight):
+                    continue
+                rec = cand.get(motif)
+                if rec is None:
+                    cand[motif] = {
+                        "best_start_idx": int(st),
+                        "best_end_idx_exclusive": int(ed),
+                        "motif_weight_mass": mass,
+                        "mean_token_weight": mean_w,
+                        "occurrences_in_sample": 1,
+                    }
+                else:
+                    rec["occurrences_in_sample"] = int(rec["occurrences_in_sample"]) + 1
+                    if (mean_w > float(rec["mean_token_weight"])) or (
+                        abs(mean_w - float(rec["mean_token_weight"])) <= 1e-12 and mass > float(rec["motif_weight_mass"])
+                    ):
+                        rec["best_start_idx"] = int(st)
+                        rec["best_end_idx_exclusive"] = int(ed)
+                        rec["motif_weight_mass"] = mass
+                        rec["mean_token_weight"] = mean_w
+
+        ranked = sorted(
+            cand.items(),
+            key=lambda kv: (
+                -float(kv[1]["mean_token_weight"]),
+                -float(kv[1]["motif_weight_mass"]),
+                -int(kv[1]["occurrences_in_sample"]),
+                kv[0],
+            ),
+        )
+        if int(top_k_per_sample) > 0:
+            ranked = ranked[: int(top_k_per_sample)]
+
+        class_name = ""
+        if s.label is not None and 0 <= int(s.label) < len(class_names):
+            class_name = str(class_names[int(s.label)])
+        verb = ""
+        adjective = ""
+        if "__" in class_name:
+            verb, adjective = class_name.split("__", 1)
+
+        for rank, (motif, info) in enumerate(ranked, start=1):
+            motif_key = _motif_to_key(motif)
+            rows.append(
+                {
+                    "mid": str(s.mid),
+                    "class_name": class_name,
+                    "verb": verb,
+                    "adjective": adjective,
+                    "motif_rank_in_sample": rank,
+                    "motif_len": len(motif),
+                    "motif_id_sequence": motif_key,
+                    "motif_key": motif_key,
+                    "best_start_idx": int(info["best_start_idx"]),
+                    "best_end_idx_exclusive": int(info["best_end_idx_exclusive"]),
+                    "occurrences_in_sample": int(info["occurrences_in_sample"]),
+                    "mean_token_weight": float(info["mean_token_weight"]),
+                    "motif_weight_mass": float(info["motif_weight_mass"]),
+                    "sample_total_token_weight": float(total_weight),
+                    "motif_weight_share_in_sample": _safe_ratio(float(info["motif_weight_mass"]), float(total_weight)),
+                }
+            )
+    return rows
+
+
+def mine_frequent_contiguous_motifs(
+    samples: Sequence[Sample],
+    min_len: int,
+    max_len: int,
+    min_support: int,
+    top_k: int,
+) -> List[Dict[str, object]]:
+    lo = max(1, int(min_len))
+    hi = max(lo, int(max_len))
+    support_by_motif: Dict[Tuple[int, ...], int] = Counter()
+    occ_by_motif: Dict[Tuple[int, ...], int] = Counter()
+
+    for s in samples:
+        seq = [int(t) for t in s.token_ids]
+        if len(seq) < lo:
+            continue
+        seen_in_sample: Set[Tuple[int, ...]] = set()
+        for st in range(len(seq)):
+            for L in range(lo, hi + 1):
+                ed = st + L
+                if ed > len(seq):
+                    break
+                motif = tuple(seq[st:ed])
+                occ_by_motif[motif] += 1
+                seen_in_sample.add(motif)
+        for motif in seen_in_sample:
+            support_by_motif[motif] += 1
+
+    candidates: List[Tuple[Tuple[int, ...], int, int, float]] = []
+    for motif, sup in support_by_motif.items():
+        if int(sup) < max(1, int(min_support)):
+            continue
+        occ = int(occ_by_motif.get(motif, 0))
+        # Prefer motifs that recur across many samples and appear repeatedly.
+        cscore = float(sup) * math.log1p(float(occ))
+        candidates.append((motif, int(sup), occ, cscore))
+
+    candidates = sorted(
+        candidates,
+        key=lambda x: (-x[1], -x[2], -len(x[0]), x[0]),
+    )
+    if int(top_k) > 0:
+        candidates = candidates[: int(top_k)]
+
+    rows: List[Dict[str, object]] = []
+    for rank, (motif, sup, occ, cscore) in enumerate(candidates, start=1):
+        key = _motif_to_key(motif)
+        rows.append(
+            {
+                "rank": rank,
+                "motif_key": key,
+                "motif_id_sequence": key,
+                "motif_len": len(motif),
+                "support_samples": int(sup),
+                "total_occurrences_in_samples": int(occ),
+                "candidate_score": float(cscore),
+                "mining_method": "frequent_contiguous",
+            }
+        )
+    return rows
+
+
+def build_motif_summary_from_global_perturbation(
+    candidate_rows: Sequence[Dict[str, object]],
+    global_rows: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    cmap = {str(r.get("motif_key", "")): dict(r) for r in candidate_rows}
+    out: List[Dict[str, object]] = []
+    for r in global_rows:
+        key = str(r.get("motif_key", ""))
+        c = cmap.get(key, {})
+        merged = {
+            "motif_key": key,
+            "motif_id_sequence": str(r.get("motif_id_sequence", c.get("motif_id_sequence", key))),
+            "motif_len": int(r.get("motif_len", c.get("motif_len", 0))),
+            "support_samples": int(r.get("support_samples", c.get("support_samples", 0))),
+            "total_occurrences_in_samples": int(c.get("total_occurrences_in_samples", 0)),
+            "candidate_score": float(c.get("candidate_score", float("nan"))),
+            "importance_score": float(r.get("importance_score", float("nan"))),
+            "primary_metric_drop": float(r.get("primary_metric_drop", float("nan"))),
+            "removed_token_ratio": float(r.get("removed_token_ratio", float("nan"))),
+            "samples_with_motif": int(r.get("samples_with_motif", 0)),
+            "total_matched_occurrences": int(r.get("total_matched_occurrences", 0)),
+        }
+        out.append(merged)
+
+    out = sorted(
+        out,
+        key=lambda x: (-float(x.get("importance_score", float("-inf"))), -int(x.get("support_samples", 0)), str(x.get("motif_key", ""))),
+    )
+    for i, r in enumerate(out, start=1):
+        r["rank"] = i
+    return out
+
+
+def _build_chain_motif_pool(
+    motif_rows: Sequence[Dict[str, object]],
+    top_k_motifs: int,
+) -> List[Tuple[str, List[int], int]]:
+    motifs: List[Tuple[str, List[int]]] = []
+    seen: Set[str] = set()
+    for r in motif_rows:
+        key = str(r.get("motif_key", r.get("motif_id_sequence", ""))).strip()
+        if not key or key in seen:
+            continue
+        seq = [int(x) for x in str(r.get("motif_id_sequence", key)).split() if str(x).strip()]
+        if not seq:
+            continue
+        motifs.append((key, seq))
+        seen.add(key)
+        if int(top_k_motifs) > 0 and len(motifs) >= int(top_k_motifs):
+            break
+    out: List[Tuple[str, List[int], int]] = []
+    for rank, (k, seq) in enumerate(motifs, start=1):
+        out.append((k, seq, rank))
+    return out
+
+
+def compute_actionrec_motif_chain_greedy(
+    model: ar.ActionClassifier,
+    samples: Sequence[Sample],
+    vocab_size: int,
+    max_tokens: int,
+    batch_size: int,
+    device: torch.device,
+    n_classes: int,
+    base_metrics: Dict[str, float],
+    motif_rows: Sequence[Dict[str, object]],
+    top_k_motifs: int,
+    max_chain_len: int,
+    min_gap: int,
+    max_gap: int,
+    min_delta: float,
+    drop_all_occurrences: bool,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    pool = _build_chain_motif_pool(motif_rows, top_k_motifs=top_k_motifs)
+    selected: List[Tuple[str, List[int]]] = []
+    used_keys: Set[str] = set()
+    current_drop = 0.0
+    for step in range(1, max(1, int(max_chain_len)) + 1):
+        best = None
+        best_delta = float("-inf")
+        best_pstats = None
+        for key, seq, _rank in pool:
+            if key in used_keys:
+                continue
+            chain = [s for _k, s in selected] + [seq]
+            pert_samples, pstats = _perturb_samples_by_global_motif_chain_drop(
+                samples=samples,
+                motifs=chain,
+                min_gap=int(min_gap),
+                max_gap=int(max_gap),
+                drop_all_occurrences=bool(drop_all_occurrences),
+            )
+            pert_metrics = eval_actionrec_samples(
+                model=model,
+                samples=pert_samples,
+                vocab_size=vocab_size,
+                max_tokens=max_tokens,
+                batch_size=batch_size,
+                device=device,
+                n_classes=n_classes,
+            )
+            delta = _summarize_action_delta(base_metrics, pert_metrics)
+            new_drop = float(delta["primary_metric_drop"])
+            gain = float(new_drop - current_drop)
+            if gain > best_delta:
+                best_delta = gain
+                best = (key, seq, delta, new_drop)
+                best_pstats = pstats
+        if best is None or best_delta < float(min_delta):
+            break
+        bkey, bseq, bdelta, bnew_drop = best
+        selected.append((bkey, bseq))
+        used_keys.add(bkey)
+        current_drop = bnew_drop
+        rows.append(
+            {
+                "chain_step": step,
+                "added_motif_key": bkey,
+                "chain_keys": " -> ".join(k for k, _s in selected),
+                "chain_size": len(selected),
+                "chain_min_gap": int(min_gap),
+                "chain_max_gap": int(max_gap),
+                "gain_primary_metric_drop": float(best_delta),
+                "importance_score": float(bdelta["primary_metric_drop"]),
+                "perturbation": "drop_ordered_motif_chain_global",
+                "drop_all_occurrences": int(bool(drop_all_occurrences)),
+                **bdelta,
+                **(best_pstats or {}),
+            }
+        )
+    return rows
+
+
+def compute_retrieval_motif_chain_greedy(
+    model: rt.DualEncoder,
+    samples: Sequence[Sample],
+    motiongpt_root: str,
+    vocab_size: int,
+    max_tokens: int,
+    max_text_len: int,
+    batch_size: int,
+    device: torch.device,
+    base_metrics: Dict[str, object],
+    cached_text_emb: np.ndarray,
+    motif_rows: Sequence[Dict[str, object]],
+    top_k_motifs: int,
+    max_chain_len: int,
+    min_gap: int,
+    max_gap: int,
+    min_delta: float,
+    drop_all_occurrences: bool,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    pool = _build_chain_motif_pool(motif_rows, top_k_motifs=top_k_motifs)
+    selected: List[Tuple[str, List[int]]] = []
+    used_keys: Set[str] = set()
+    current_drop = 0.0
+    for step in range(1, max(1, int(max_chain_len)) + 1):
+        best = None
+        best_delta = float("-inf")
+        best_pstats = None
+        for key, seq, _rank in pool:
+            if key in used_keys:
+                continue
+            chain = [s for _k, s in selected] + [seq]
+            pert_samples, pstats = _perturb_samples_by_global_motif_chain_drop(
+                samples=samples,
+                motifs=chain,
+                min_gap=int(min_gap),
+                max_gap=int(max_gap),
+                drop_all_occurrences=bool(drop_all_occurrences),
+            )
+            pert_metrics = evaluate_retrieval(
+                model=model,
+                samples=pert_samples,
+                motiongpt_root=motiongpt_root,
+                vocab_size=vocab_size,
+                max_tokens=max_tokens,
+                max_text_len=max_text_len,
+                batch_size=batch_size,
+                device=device,
+                cached_text_emb=cached_text_emb,
+            )
+            delta = _summarize_retrieval_delta(base_metrics, pert_metrics)
+            new_drop = float(delta["primary_metric_drop"])
+            gain = float(new_drop - current_drop)
+            if gain > best_delta:
+                best_delta = gain
+                best = (key, seq, delta, new_drop)
+                best_pstats = pstats
+        if best is None or best_delta < float(min_delta):
+            break
+        bkey, bseq, bdelta, bnew_drop = best
+        selected.append((bkey, bseq))
+        used_keys.add(bkey)
+        current_drop = bnew_drop
+        rows.append(
+            {
+                "chain_step": step,
+                "added_motif_key": bkey,
+                "chain_keys": " -> ".join(k for k, _s in selected),
+                "chain_size": len(selected),
+                "chain_min_gap": int(min_gap),
+                "chain_max_gap": int(max_gap),
+                "gain_primary_metric_drop": float(best_delta),
+                "importance_score": float(bdelta["primary_metric_drop"]),
+                "perturbation": "drop_ordered_motif_chain_global",
+                "drop_all_occurrences": int(bool(drop_all_occurrences)),
+                **bdelta,
+                **(best_pstats or {}),
+            }
+        )
+    return rows
+
+
+@torch.no_grad()
+def _score_actionrec_single_sample(
+    model: ar.ActionClassifier,
+    sample: Sample,
+    vocab_size: int,
+    max_tokens: int,
+    device: torch.device,
+    score_target: str,
+) -> float:
+    if sample.label is None:
+        return float("nan")
+    if score_target not in {"true_logit", "neg_ce"}:
+        raise ValueError(f"unsupported actionrec motif score_target: {score_target}")
+    x, mask, _ = collate_tokens_safe([sample.token_ids], vocab_size=vocab_size, max_len=max_tokens)
+    x = x.to(device)
+    mask = mask.to(device)
+    y = torch.tensor([int(sample.label)], dtype=torch.long, device=device)
+    logits = model(x, mask)
+    if score_target == "true_logit":
+        return float(logits[0, int(y.item())].detach().cpu().item())
+    return float((-F.cross_entropy(logits, y)).detach().cpu().item())
+
+
+@torch.no_grad()
+def _score_retrieval_single_sample(
+    model: rt.DualEncoder,
+    sample: Sample,
+    wvec,
+    max_text_len: int,
+    vocab_size: int,
+    max_tokens: int,
+    device: torch.device,
+    score_target: str,
+) -> float:
+    if score_target != "diag_cosine":
+        raise ValueError(f"unsupported retrieval motif score_target: {score_target}")
+    x, mask, _ = collate_tokens_safe([sample.token_ids], vocab_size=vocab_size, max_len=max_tokens)
+    x = x.to(device)
+    mask = mask.to(device)
+    w, p, L = build_word_pos_tensors(wvec, sample.text_tokens, max_text_len=max_text_len)
+    word = torch.from_numpy(np.expand_dims(w, axis=0)).to(device)
+    pos = torch.from_numpy(np.expand_dims(p, axis=0)).to(device)
+    tlen = torch.tensor([int(L)], dtype=torch.long, device=device)
+    m = model.motion_enc(x, mask)
+    t = model.text_enc(word, pos, tlen)
+    return float((t * m).sum(dim=-1)[0].detach().cpu().item())
+
+
+def validate_actionrec_motifs_with_perturbation(
+    model: ar.ActionClassifier,
+    samples: Sequence[Sample],
+    motif_rows: Sequence[Dict[str, object]],
+    vocab_size: int,
+    max_tokens: int,
+    device: torch.device,
+    score_target: str,
+    drop_all_occurrences: bool,
+) -> List[Dict[str, object]]:
+    mid_to_sample = {str(s.mid): s for s in samples}
+    base_cache: Dict[str, float] = {}
+    out: List[Dict[str, object]] = []
+
+    for r in motif_rows:
+        mid = str(r.get("mid", ""))
+        sample = mid_to_sample.get(mid)
+        if sample is None:
+            continue
+        motif = [int(x) for x in str(r.get("motif_id_sequence", "")).split() if str(x).strip()]
+        if not motif:
+            continue
+
+        base_score = base_cache.get(mid)
+        if base_score is None:
+            base_score = _score_actionrec_single_sample(
+                model=model,
+                sample=sample,
+                vocab_size=vocab_size,
+                max_tokens=max_tokens,
+                device=device,
+                score_target=score_target,
+            )
+            base_cache[mid] = base_score
+        new_tokens, n_removed_occ = _drop_motif_occurrences(sample.token_ids, motif, drop_all_occurrences=drop_all_occurrences)
+        if not new_tokens:
+            new_tokens = list(sample.token_ids[:1]) if sample.token_ids else [0]
+        pert_sample = Sample(mid=sample.mid, token_ids=new_tokens, label=sample.label, text_tokens=list(sample.text_tokens))
+        pert_score = _score_actionrec_single_sample(
+            model=model,
+            sample=pert_sample,
+            vocab_size=vocab_size,
+            max_tokens=max_tokens,
+            device=device,
+            score_target=score_target,
+        )
+        out.append(
+            {
+                **dict(r),
+                "score_target": score_target,
+                "perturbation": "drop_motif_sequence",
+                "drop_all_occurrences": int(bool(drop_all_occurrences)),
+                "matched_occurrences": int(n_removed_occ),
+                "tokens_before": len(sample.token_ids),
+                "tokens_after": len(new_tokens),
+                "removed_token_ratio": _safe_ratio(float(len(sample.token_ids) - len(new_tokens)), float(max(1, len(sample.token_ids)))),
+                "base_sample_score": float(base_score),
+                "perturbed_sample_score": float(pert_score),
+                "sample_score_drop": float(base_score - pert_score),
+                "sample_score_ratio": _safe_ratio(float(pert_score), float(base_score)),
+            }
+        )
+    return out
+
+
+def validate_retrieval_motifs_with_perturbation(
+    model: rt.DualEncoder,
+    samples: Sequence[Sample],
+    motif_rows: Sequence[Dict[str, object]],
+    wvec,
+    max_text_len: int,
+    vocab_size: int,
+    max_tokens: int,
+    device: torch.device,
+    score_target: str,
+    drop_all_occurrences: bool,
+) -> List[Dict[str, object]]:
+    mid_to_sample = {str(s.mid): s for s in samples}
+    base_cache: Dict[str, float] = {}
+    out: List[Dict[str, object]] = []
+
+    for r in motif_rows:
+        mid = str(r.get("mid", ""))
+        sample = mid_to_sample.get(mid)
+        if sample is None:
+            continue
+        motif = [int(x) for x in str(r.get("motif_id_sequence", "")).split() if str(x).strip()]
+        if not motif:
+            continue
+
+        base_score = base_cache.get(mid)
+        if base_score is None:
+            base_score = _score_retrieval_single_sample(
+                model=model,
+                sample=sample,
+                wvec=wvec,
+                max_text_len=max_text_len,
+                vocab_size=vocab_size,
+                max_tokens=max_tokens,
+                device=device,
+                score_target=score_target,
+            )
+            base_cache[mid] = base_score
+        new_tokens, n_removed_occ = _drop_motif_occurrences(sample.token_ids, motif, drop_all_occurrences=drop_all_occurrences)
+        if not new_tokens:
+            new_tokens = list(sample.token_ids[:1]) if sample.token_ids else [0]
+        pert_sample = Sample(mid=sample.mid, token_ids=new_tokens, label=sample.label, text_tokens=list(sample.text_tokens))
+        pert_score = _score_retrieval_single_sample(
+            model=model,
+            sample=pert_sample,
+            wvec=wvec,
+            max_text_len=max_text_len,
+            vocab_size=vocab_size,
+            max_tokens=max_tokens,
+            device=device,
+            score_target=score_target,
+        )
+        out.append(
+            {
+                **dict(r),
+                "score_target": score_target,
+                "perturbation": "drop_motif_sequence",
+                "drop_all_occurrences": int(bool(drop_all_occurrences)),
+                "matched_occurrences": int(n_removed_occ),
+                "tokens_before": len(sample.token_ids),
+                "tokens_after": len(new_tokens),
+                "removed_token_ratio": _safe_ratio(float(len(sample.token_ids) - len(new_tokens)), float(max(1, len(sample.token_ids)))),
+                "base_sample_score": float(base_score),
+                "perturbed_sample_score": float(pert_score),
+                "sample_score_drop": float(base_score - pert_score),
+                "sample_score_ratio": _safe_ratio(float(pert_score), float(base_score)),
+            }
+        )
+    return out
+
+
+def summarize_recurring_motifs(
+    motif_rows: Sequence[Dict[str, object]],
+    motif_perturb_rows: Sequence[Dict[str, object]],
+    min_support: int,
+    top_k: int,
+) -> List[Dict[str, object]]:
+    by_key: Dict[str, Dict[str, object]] = {}
+    for r in motif_rows:
+        key = str(r.get("motif_key", "")).strip()
+        if not key:
+            continue
+        rec = by_key.setdefault(
+            key,
+            {
+                "motif_key": key,
+                "motif_id_sequence": str(r.get("motif_id_sequence", key)),
+                "motif_len": int(r.get("motif_len", 0)),
+                "samples": set(),
+                "total_occ": 0,
+                "motif_scores": [],
+                "motif_weight_shares": [],
+            },
+        )
+        rec["samples"].add(str(r.get("mid", "")))
+        rec["total_occ"] = int(rec["total_occ"]) + int(r.get("occurrences_in_sample", 0))
+        rec["motif_scores"].append(float(r.get("mean_token_weight", 0.0)))
+        rec["motif_weight_shares"].append(float(r.get("motif_weight_share_in_sample", 0.0)))
+
+    by_key_drop: Dict[str, List[float]] = {}
+    by_key_drop_pos: Dict[str, int] = {}
+    by_key_removed_ratio: Dict[str, List[float]] = {}
+    for r in motif_perturb_rows:
+        key = str(r.get("motif_key", "")).strip()
+        if not key:
+            continue
+        drop = float(r.get("sample_score_drop", 0.0))
+        by_key_drop.setdefault(key, []).append(drop)
+        by_key_removed_ratio.setdefault(key, []).append(float(r.get("removed_token_ratio", 0.0)))
+        if drop > 0.0:
+            by_key_drop_pos[key] = int(by_key_drop_pos.get(key, 0)) + 1
+
+    rows: List[Dict[str, object]] = []
+    for key, rec in by_key.items():
+        support = len(rec["samples"])
+        if support < max(1, int(min_support)):
+            continue
+        drops = by_key_drop.get(key, [])
+        pos = int(by_key_drop_pos.get(key, 0))
+        rows.append(
+            {
+                "motif_key": key,
+                "motif_id_sequence": rec["motif_id_sequence"],
+                "motif_len": int(rec["motif_len"]),
+                "support_samples": support,
+                "total_occurrences_in_samples": int(rec["total_occ"]),
+                "mean_token_weight": float(np.mean(rec["motif_scores"])) if rec["motif_scores"] else float("nan"),
+                "mean_motif_weight_share_in_sample": float(np.mean(rec["motif_weight_shares"])) if rec["motif_weight_shares"] else float("nan"),
+                "mean_score_drop": float(np.mean(drops)) if drops else float("nan"),
+                "median_score_drop": float(np.median(np.asarray(drops, dtype=np.float64))) if drops else float("nan"),
+                "positive_drop_rate": _safe_ratio(float(pos), float(len(drops))) if drops else float("nan"),
+                "mean_removed_token_ratio": float(np.mean(by_key_removed_ratio.get(key, []))) if by_key_removed_ratio.get(key) else float("nan"),
+            }
+        )
+
+    def _score_or_neginf(v: object) -> float:
+        x = float(v)
+        return x if not math.isnan(x) else float("-inf")
+
+    rows = sorted(
+        rows,
+        key=lambda r: (
+            float(r.get("support_samples", 0)),
+            _score_or_neginf(r.get("mean_score_drop", float("nan"))),
+            _score_or_neginf(r.get("mean_token_weight", float("nan"))),
+            str(r.get("motif_key", "")),
+        ),
+        reverse=True,
+    )
+    if int(top_k) > 0:
+        rows = rows[: int(top_k)]
+    for i, r in enumerate(rows, start=1):
+        r["rank"] = i
+    return rows
+
+
 def write_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
     if not rows:
         path.write_text("", encoding="utf-8")
@@ -1389,6 +2530,32 @@ def main() -> None:
     ap.add_argument("--perturb_top_k_ids", type=int, default=50, help="Top-K globally important IDs for single-ID deletion test.")
     ap.add_argument("--curve_top_p_values", type=str, default="0.1,0.2,0.3,0.5,0.7,0.9,1.0")
     ap.add_argument("--curve_top_k_values", type=str, default="1,2,3,5,10,20")
+    ap.add_argument("--motif_min_len", type=int, default=2)
+    ap.add_argument("--motif_max_len", type=int, default=6)
+    ap.add_argument("--motif_mining_method", type=str, default="attr_contiguous",
+                    choices=["attr_contiguous", "frequent_contiguous"],
+                    help="How to generate motif candidates before perturbation scoring.")
+    ap.add_argument("--motif_candidate_top_k", type=int, default=500,
+                    help="Top-K motif candidates before global perturbation scoring.")
+    ap.add_argument("--motif_top_k_per_sample", type=int, default=5)
+    ap.add_argument("--motif_min_mean_weight", type=float, default=0.02)
+    ap.add_argument("--motif_drop_all_occurrences", type=int, default=1, choices=[0, 1])
+    ap.add_argument("--motif_score_target", type=str, default="",
+                    help="actionrec: true_logit/neg_ce, retrieval: diag_cosine (single-sample validation).")
+    ap.add_argument("--motif_min_support", type=int, default=2)
+    ap.add_argument("--motif_summary_top_k", type=int, default=200)
+    ap.add_argument("--motif_perturb_top_k", type=int, default=50,
+                    help="Top-K recurring motifs (from motif summary) for global perturbation.")
+    ap.add_argument("--motif_set_top_k_values", type=str, default="1,2,3,5,10,20",
+                    help="Top-k values for cumulative motif-set perturbation (drop top-k motifs together).")
+    ap.add_argument("--motif_chain_enable", type=int, default=1, choices=[0, 1])
+    ap.add_argument("--motif_chain_top_k_motifs", type=int, default=40,
+                    help="Use top-k motifs from motif summary as chain candidate pool.")
+    ap.add_argument("--motif_chain_max_len", type=int, default=8)
+    ap.add_argument("--motif_chain_min_gap", type=int, default=0)
+    ap.add_argument("--motif_chain_max_gap", type=int, default=8)
+    ap.add_argument("--motif_chain_min_delta", type=float, default=0.0,
+                    help="Minimum incremental primary_metric_drop gain to keep greedy chain expansion.")
 
     args = ap.parse_args()
     out_dir = Path(args.out_dir)
@@ -1398,6 +2565,7 @@ def main() -> None:
     type_mapper = IdTypeMapper(args.id_type_mode, args.id_type_bucket_size, args.id_type_modulo)
     curve_top_p_values = _parse_float_list(args.curve_top_p_values)
     curve_top_k_values = _parse_int_list(args.curve_top_k_values)
+    motif_set_top_k_values = _parse_int_list(args.motif_set_top_k_values)
 
     all_samples, labeled_samples, dataset_key = load_samples(
         args.hml_root, args.token_root, args.split, args.max_tokens
@@ -1420,6 +2588,13 @@ def main() -> None:
     budget_curve_rows: List[Dict[str, object]] = []
     attr_coverage_per_sample_rows: List[Dict[str, object]] = []
     attr_coverage_summary_rows: List[Dict[str, object]] = []
+    motif_per_sample_rows: List[Dict[str, object]] = []
+    motif_perturb_per_sample_rows: List[Dict[str, object]] = []
+    motif_perturb_global_rows: List[Dict[str, object]] = []
+    motif_set_perturb_rows: List[Dict[str, object]] = []
+    motif_chain_perturb_rows: List[Dict[str, object]] = []
+    motif_summary_rows: List[Dict[str, object]] = []
+    motif_score_target_used = ""
     base_metrics: Dict[str, object]
 
     if args.task == "actionrec":
@@ -1454,6 +2629,103 @@ def main() -> None:
             class_names=class_names,
         )
         attr_coverage_per_sample_rows, attr_coverage_summary_rows = compute_attr_coverage_rows(attr_sample_rows)
+        if str(args.motif_mining_method) == "frequent_contiguous":
+            motif_candidates = mine_frequent_contiguous_motifs(
+                samples=run_samples,
+                min_len=args.motif_min_len,
+                max_len=args.motif_max_len,
+                min_support=args.motif_min_support,
+                top_k=args.motif_candidate_top_k,
+            )
+            motif_score_target_used = "global_primary_metric"
+            motif_perturb_global_rows = compute_actionrec_motif_perturbation(
+                model=model,
+                samples=run_samples,
+                vocab_size=args.vocab_size,
+                max_tokens=args.max_tokens,
+                batch_size=args.batch_size,
+                device=device,
+                n_classes=n_classes,
+                base_metrics=base,
+                motif_rows=motif_candidates,
+                top_k_motifs=args.motif_perturb_top_k,
+                drop_all_occurrences=bool(int(args.motif_drop_all_occurrences)),
+            )
+            motif_summary_rows = build_motif_summary_from_global_perturbation(
+                candidate_rows=motif_candidates,
+                global_rows=motif_perturb_global_rows,
+            )
+        else:
+            motif_per_sample_rows = extract_sample_motifs(
+                samples=run_samples,
+                per_sample_rows=attr_sample_rows,
+                class_names=class_names,
+                min_len=args.motif_min_len,
+                max_len=args.motif_max_len,
+                top_k_per_sample=args.motif_top_k_per_sample,
+                min_mean_weight=args.motif_min_mean_weight,
+            )
+            motif_score_target_used = str(args.motif_score_target).strip() or "true_logit"
+            motif_perturb_per_sample_rows = validate_actionrec_motifs_with_perturbation(
+                model=model,
+                samples=run_samples,
+                motif_rows=motif_per_sample_rows,
+                vocab_size=args.vocab_size,
+                max_tokens=args.max_tokens,
+                device=device,
+                score_target=motif_score_target_used,
+                drop_all_occurrences=bool(int(args.motif_drop_all_occurrences)),
+            )
+            motif_summary_rows = summarize_recurring_motifs(
+                motif_rows=motif_per_sample_rows,
+                motif_perturb_rows=motif_perturb_per_sample_rows,
+                min_support=args.motif_min_support,
+                top_k=args.motif_summary_top_k,
+            )
+            motif_perturb_global_rows = compute_actionrec_motif_perturbation(
+                model=model,
+                samples=run_samples,
+                vocab_size=args.vocab_size,
+                max_tokens=args.max_tokens,
+                batch_size=args.batch_size,
+                device=device,
+                n_classes=n_classes,
+                base_metrics=base,
+                motif_rows=motif_summary_rows,
+                top_k_motifs=args.motif_perturb_top_k,
+                drop_all_occurrences=bool(int(args.motif_drop_all_occurrences)),
+            )
+        motif_set_perturb_rows = compute_actionrec_motif_set_perturbation(
+            model=model,
+            samples=run_samples,
+            vocab_size=args.vocab_size,
+            max_tokens=args.max_tokens,
+            batch_size=args.batch_size,
+            device=device,
+            n_classes=n_classes,
+            base_metrics=base,
+            motif_rows=motif_summary_rows,
+            top_k_values=motif_set_top_k_values,
+            drop_all_occurrences=bool(int(args.motif_drop_all_occurrences)),
+        )
+        if int(args.motif_chain_enable) == 1:
+            motif_chain_perturb_rows = compute_actionrec_motif_chain_greedy(
+                model=model,
+                samples=run_samples,
+                vocab_size=args.vocab_size,
+                max_tokens=args.max_tokens,
+                batch_size=args.batch_size,
+                device=device,
+                n_classes=n_classes,
+                base_metrics=base,
+                motif_rows=motif_summary_rows,
+                top_k_motifs=args.motif_chain_top_k_motifs,
+                max_chain_len=args.motif_chain_max_len,
+                min_gap=args.motif_chain_min_gap,
+                max_gap=args.motif_chain_max_gap,
+                min_delta=args.motif_chain_min_delta,
+                drop_all_occurrences=bool(int(args.motif_drop_all_occurrences)),
+            )
         perturb_rows = compute_actionrec_id_perturbation(
             model=model,
             samples=run_samples,
@@ -1535,6 +2807,114 @@ def main() -> None:
             class_names=class_names,
         )
         attr_coverage_per_sample_rows, attr_coverage_summary_rows = compute_attr_coverage_rows(attr_sample_rows)
+        if str(args.motif_mining_method) == "frequent_contiguous":
+            motif_candidates = mine_frequent_contiguous_motifs(
+                samples=run_samples,
+                min_len=args.motif_min_len,
+                max_len=args.motif_max_len,
+                min_support=args.motif_min_support,
+                top_k=args.motif_candidate_top_k,
+            )
+            motif_score_target_used = "global_primary_metric"
+            motif_perturb_global_rows = compute_retrieval_motif_perturbation(
+                model=model,
+                samples=run_samples,
+                motiongpt_root=args.motiongpt_root,
+                vocab_size=args.vocab_size,
+                max_tokens=args.max_tokens,
+                max_text_len=args.max_text_len,
+                batch_size=args.batch_size,
+                device=device,
+                base_metrics=base,
+                cached_text_emb=text_emb,
+                motif_rows=motif_candidates,
+                top_k_motifs=args.motif_perturb_top_k,
+                drop_all_occurrences=bool(int(args.motif_drop_all_occurrences)),
+            )
+            motif_summary_rows = build_motif_summary_from_global_perturbation(
+                candidate_rows=motif_candidates,
+                global_rows=motif_perturb_global_rows,
+            )
+        else:
+            motif_per_sample_rows = extract_sample_motifs(
+                samples=run_samples,
+                per_sample_rows=attr_sample_rows,
+                class_names=class_names,
+                min_len=args.motif_min_len,
+                max_len=args.motif_max_len,
+                top_k_per_sample=args.motif_top_k_per_sample,
+                min_mean_weight=args.motif_min_mean_weight,
+            )
+            motif_score_target_used = "diag_cosine"
+            wvec = load_word_vectorizer(Path(args.motiongpt_root))
+            motif_perturb_per_sample_rows = validate_retrieval_motifs_with_perturbation(
+                model=model,
+                samples=run_samples,
+                motif_rows=motif_per_sample_rows,
+                wvec=wvec,
+                max_text_len=args.max_text_len,
+                vocab_size=args.vocab_size,
+                max_tokens=args.max_tokens,
+                device=device,
+                score_target=motif_score_target_used,
+                drop_all_occurrences=bool(int(args.motif_drop_all_occurrences)),
+            )
+            motif_summary_rows = summarize_recurring_motifs(
+                motif_rows=motif_per_sample_rows,
+                motif_perturb_rows=motif_perturb_per_sample_rows,
+                min_support=args.motif_min_support,
+                top_k=args.motif_summary_top_k,
+            )
+            motif_perturb_global_rows = compute_retrieval_motif_perturbation(
+                model=model,
+                samples=run_samples,
+                motiongpt_root=args.motiongpt_root,
+                vocab_size=args.vocab_size,
+                max_tokens=args.max_tokens,
+                max_text_len=args.max_text_len,
+                batch_size=args.batch_size,
+                device=device,
+                base_metrics=base,
+                cached_text_emb=text_emb,
+                motif_rows=motif_summary_rows,
+                top_k_motifs=args.motif_perturb_top_k,
+                drop_all_occurrences=bool(int(args.motif_drop_all_occurrences)),
+            )
+        motif_set_perturb_rows = compute_retrieval_motif_set_perturbation(
+            model=model,
+            samples=run_samples,
+            motiongpt_root=args.motiongpt_root,
+            vocab_size=args.vocab_size,
+            max_tokens=args.max_tokens,
+            max_text_len=args.max_text_len,
+            batch_size=args.batch_size,
+            device=device,
+            base_metrics=base,
+            cached_text_emb=text_emb,
+            motif_rows=motif_summary_rows,
+            top_k_values=motif_set_top_k_values,
+            drop_all_occurrences=bool(int(args.motif_drop_all_occurrences)),
+        )
+        if int(args.motif_chain_enable) == 1:
+            motif_chain_perturb_rows = compute_retrieval_motif_chain_greedy(
+                model=model,
+                samples=run_samples,
+                motiongpt_root=args.motiongpt_root,
+                vocab_size=args.vocab_size,
+                max_tokens=args.max_tokens,
+                max_text_len=args.max_text_len,
+                batch_size=args.batch_size,
+                device=device,
+                base_metrics=base,
+                cached_text_emb=text_emb,
+                motif_rows=motif_summary_rows,
+                top_k_motifs=args.motif_chain_top_k_motifs,
+                max_chain_len=args.motif_chain_max_len,
+                min_gap=args.motif_chain_min_gap,
+                max_gap=args.motif_chain_max_gap,
+                min_delta=args.motif_chain_min_delta,
+                drop_all_occurrences=bool(int(args.motif_drop_all_occurrences)),
+            )
         perturb_rows = compute_retrieval_id_perturbation(
             model=model,
             samples=run_samples,
@@ -1588,6 +2968,12 @@ def main() -> None:
     write_csv(out_dir / "id_budget_curves.csv", budget_curve_rows)
     write_csv(out_dir / "id_attr_coverage_per_sample.csv", attr_coverage_per_sample_rows)
     write_csv(out_dir / "id_attr_coverage_summary.csv", attr_coverage_summary_rows)
+    write_csv(out_dir / "id_sequence_motifs_per_sample.csv", motif_per_sample_rows)
+    write_csv(out_dir / "id_sequence_motif_perturbation_per_sample.csv", motif_perturb_per_sample_rows)
+    write_csv(out_dir / "id_sequence_motif_perturbation.csv", motif_perturb_global_rows)
+    write_csv(out_dir / "id_sequence_motif_set_perturbation.csv", motif_set_perturb_rows)
+    write_csv(out_dir / "id_sequence_motif_chain_perturbation.csv", motif_chain_perturb_rows)
+    write_csv(out_dir / "id_sequence_motif_summary.csv", motif_summary_rows)
 
     summary = {
         "task": args.task,
@@ -1606,6 +2992,24 @@ def main() -> None:
         "perturb_top_k_ids": int(args.perturb_top_k_ids),
         "curve_top_p_values": curve_top_p_values,
         "curve_top_k_values": curve_top_k_values,
+        "motif_mining_method": str(args.motif_mining_method),
+        "motif_candidate_top_k": int(args.motif_candidate_top_k),
+        "motif_min_len": int(args.motif_min_len),
+        "motif_max_len": int(args.motif_max_len),
+        "motif_top_k_per_sample": int(args.motif_top_k_per_sample),
+        "motif_min_mean_weight": float(args.motif_min_mean_weight),
+        "motif_drop_all_occurrences": int(args.motif_drop_all_occurrences),
+        "motif_score_target": motif_score_target_used,
+        "motif_min_support": int(args.motif_min_support),
+        "motif_summary_top_k": int(args.motif_summary_top_k),
+        "motif_perturb_top_k": int(args.motif_perturb_top_k),
+        "motif_set_top_k_values": motif_set_top_k_values,
+        "motif_chain_enable": int(args.motif_chain_enable),
+        "motif_chain_top_k_motifs": int(args.motif_chain_top_k_motifs),
+        "motif_chain_max_len": int(args.motif_chain_max_len),
+        "motif_chain_min_gap": int(args.motif_chain_min_gap),
+        "motif_chain_max_gap": int(args.motif_chain_max_gap),
+        "motif_chain_min_delta": float(args.motif_chain_min_delta),
         "n_samples_all": len(all_samples),
         "n_samples_labeled": len(labeled_samples),
         "n_samples_eval": len(run_samples),
@@ -1625,6 +3029,12 @@ def main() -> None:
             "id_budget_curves": str(out_dir / "id_budget_curves.csv"),
             "id_attr_coverage_per_sample": str(out_dir / "id_attr_coverage_per_sample.csv"),
             "id_attr_coverage_summary": str(out_dir / "id_attr_coverage_summary.csv"),
+            "id_sequence_motifs_per_sample": str(out_dir / "id_sequence_motifs_per_sample.csv"),
+            "id_sequence_motif_perturbation": str(out_dir / "id_sequence_motif_perturbation.csv"),
+            "id_sequence_motif_perturbation_per_sample": str(out_dir / "id_sequence_motif_perturbation_per_sample.csv"),
+            "id_sequence_motif_set_perturbation": str(out_dir / "id_sequence_motif_set_perturbation.csv"),
+            "id_sequence_motif_chain_perturbation": str(out_dir / "id_sequence_motif_chain_perturbation.csv"),
+            "id_sequence_motif_summary": str(out_dir / "id_sequence_motif_summary.csv"),
         },
     }
     (out_dir / "id_contrib_summary.json").write_text(
