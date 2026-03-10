@@ -203,7 +203,7 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.07)
 
     ap.add_argument("--batch_size", type=int, default=64)
-    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--seed", type=int, default=1234)

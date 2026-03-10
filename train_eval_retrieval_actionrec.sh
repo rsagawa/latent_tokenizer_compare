@@ -4,6 +4,7 @@ set -euo pipefail
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 BASE_DIR="${BASE_DIR:-experiments/bandai}"
 HML_ROOT="${HML_ROOT:-../Bandai/HumanML3D_Bandai2_20FPS}"
+MOTIONGPT_ROOT="${MOTIONGPT_ROOT:-../MotionGPT}"
 
 BATCH_SIZE="${BATCH_SIZE:-64}"
 BASE_EPOCHS="${EPOCHS:-20}"
@@ -37,6 +38,7 @@ for i in "${!NAMES[@]}"; do
 
   echo "[${idx}/${TOTAL}] retrieval: ${name} (vocab_size=${vocab_size})"
   "${PYTHON_BIN}" train_eval_retrieval_hml_tokens.py \
+    --motiongpt_root "${MOTIONGPT_ROOT}" \
     --vocab_size "${vocab_size}" \
     --hml_root "${HML_ROOT}" \
     --token_root "${token_root}" \

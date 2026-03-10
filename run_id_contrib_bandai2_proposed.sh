@@ -27,6 +27,23 @@ ID_TYPE_MODULO="${ID_TYPE_MODULO:-4}"
 ATTR_TOP_K="${ATTR_TOP_K:-0}"
 ATTR_SCORE_TARGET_ACTIONREC="${ATTR_SCORE_TARGET_ACTIONREC:-true_logit}"
 ATTR_SCORE_TARGET_RETRIEVAL="${ATTR_SCORE_TARGET_RETRIEVAL:-diag_cosine}"
+MOTIF_MINING_METHOD="${MOTIF_MINING_METHOD:-frequent_contiguous}"
+MOTIF_CANDIDATE_TOP_K="${MOTIF_CANDIDATE_TOP_K:-1000}"
+MOTIF_MIN_LEN="${MOTIF_MIN_LEN:-2}"
+MOTIF_MAX_LEN="${MOTIF_MAX_LEN:-6}"
+MOTIF_MIN_SUPPORT="${MOTIF_MIN_SUPPORT:-3}"
+MOTIF_SUMMARY_TOP_K="${MOTIF_SUMMARY_TOP_K:-1000}"
+MOTIF_PERTURB_TOP_K="${MOTIF_PERTURB_TOP_K:-1000}"
+MOTIF_SET_TOP_K_VALUES="${MOTIF_SET_TOP_K_VALUES:-1,2,3,5,10,20,50,100,200,500,1000}"
+MOTIF_DROP_ALL_OCCURRENCES="${MOTIF_DROP_ALL_OCCURRENCES:-1}"
+MOTIF_TOP_K_PER_SAMPLE="${MOTIF_TOP_K_PER_SAMPLE:-5}"
+MOTIF_MIN_MEAN_WEIGHT="${MOTIF_MIN_MEAN_WEIGHT:-0.02}"
+MOTIF_CHAIN_ENABLE="${MOTIF_CHAIN_ENABLE:-0}"
+MOTIF_CHAIN_TOP_K_MOTIFS="${MOTIF_CHAIN_TOP_K_MOTIFS:-40}"
+MOTIF_CHAIN_MAX_LEN="${MOTIF_CHAIN_MAX_LEN:-8}"
+MOTIF_CHAIN_MIN_GAP="${MOTIF_CHAIN_MIN_GAP:-0}"
+MOTIF_CHAIN_MAX_GAP="${MOTIF_CHAIN_MAX_GAP:-100}"
+MOTIF_CHAIN_MIN_DELTA="${MOTIF_CHAIN_MIN_DELTA:--1e9}"
 
 BASE_DIR="${BASE_DIR:-experiments/bandai}"
 OUT_SUFFIX="${OUT_SUFFIX:-id_contrib_test}"
@@ -66,6 +83,23 @@ for i in "${!NAMES[@]}"; do
     --top_k_types "${TOP_K_TYPES}" \
     --attr_top_k "${ATTR_TOP_K}" \
     --attr_score_target "${ATTR_SCORE_TARGET_ACTIONREC}" \
+    --motif_mining_method "${MOTIF_MINING_METHOD}" \
+    --motif_candidate_top_k "${MOTIF_CANDIDATE_TOP_K}" \
+    --motif_min_len "${MOTIF_MIN_LEN}" \
+    --motif_max_len "${MOTIF_MAX_LEN}" \
+    --motif_min_support "${MOTIF_MIN_SUPPORT}" \
+    --motif_summary_top_k "${MOTIF_SUMMARY_TOP_K}" \
+    --motif_perturb_top_k "${MOTIF_PERTURB_TOP_K}" \
+    --motif_set_top_k_values "${MOTIF_SET_TOP_K_VALUES}" \
+    --motif_drop_all_occurrences "${MOTIF_DROP_ALL_OCCURRENCES}" \
+    --motif_chain_enable "${MOTIF_CHAIN_ENABLE}" \
+    --motif_chain_top_k_motifs "${MOTIF_CHAIN_TOP_K_MOTIFS}" \
+    --motif_chain_max_len "${MOTIF_CHAIN_MAX_LEN}" \
+    --motif_chain_min_gap "${MOTIF_CHAIN_MIN_GAP}" \
+    --motif_chain_max_gap "${MOTIF_CHAIN_MAX_GAP}" \
+    --motif_chain_min_delta="${MOTIF_CHAIN_MIN_DELTA}" \
+    --motif_top_k_per_sample "${MOTIF_TOP_K_PER_SAMPLE}" \
+    --motif_min_mean_weight "${MOTIF_MIN_MEAN_WEIGHT}" \
     --id_type_mode "${ID_TYPE_MODE}" \
     --id_type_bucket_size "${ID_TYPE_BUCKET_SIZE}" \
     --id_type_modulo "${ID_TYPE_MODULO}"
@@ -88,6 +122,23 @@ for i in "${!NAMES[@]}"; do
     --top_k_types "${TOP_K_TYPES}" \
     --attr_top_k "${ATTR_TOP_K}" \
     --attr_score_target "${ATTR_SCORE_TARGET_RETRIEVAL}" \
+    --motif_mining_method "${MOTIF_MINING_METHOD}" \
+    --motif_candidate_top_k "${MOTIF_CANDIDATE_TOP_K}" \
+    --motif_min_len "${MOTIF_MIN_LEN}" \
+    --motif_max_len "${MOTIF_MAX_LEN}" \
+    --motif_min_support "${MOTIF_MIN_SUPPORT}" \
+    --motif_summary_top_k "${MOTIF_SUMMARY_TOP_K}" \
+    --motif_perturb_top_k "${MOTIF_PERTURB_TOP_K}" \
+    --motif_set_top_k_values "${MOTIF_SET_TOP_K_VALUES}" \
+    --motif_drop_all_occurrences "${MOTIF_DROP_ALL_OCCURRENCES}" \
+    --motif_chain_enable "${MOTIF_CHAIN_ENABLE}" \
+    --motif_chain_top_k_motifs "${MOTIF_CHAIN_TOP_K_MOTIFS}" \
+    --motif_chain_max_len "${MOTIF_CHAIN_MAX_LEN}" \
+    --motif_chain_min_gap "${MOTIF_CHAIN_MIN_GAP}" \
+    --motif_chain_max_gap "${MOTIF_CHAIN_MAX_GAP}" \
+    --motif_chain_min_delta="${MOTIF_CHAIN_MIN_DELTA}" \
+    --motif_top_k_per_sample "${MOTIF_TOP_K_PER_SAMPLE}" \
+    --motif_min_mean_weight "${MOTIF_MIN_MEAN_WEIGHT}" \
     --id_type_mode "${ID_TYPE_MODE}" \
     --id_type_bucket_size "${ID_TYPE_BUCKET_SIZE}" \
     --id_type_modulo "${ID_TYPE_MODULO}"
