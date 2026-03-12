@@ -1783,6 +1783,412 @@ def _build_mid_to_id_weight_map(per_sample_rows: Sequence[Dict[str, object]]) ->
     return out
 
 
+def _dedup_consecutive(seq: Sequence[int]) -> List[int]:
+    out: List[int] = []
+    prev = None
+    for x in seq:
+        xx = int(x)
+        if prev is not None and xx == prev:
+            continue
+        out.append(xx)
+        prev = xx
+    return out
+
+
+def _weighted_jaccard(a: Dict[int, float], b: Dict[int, float]) -> float:
+    keys = set(int(k) for k in a.keys()) | set(int(k) for k in b.keys())
+    if not keys:
+        return 0.0
+    inter = 0.0
+    union = 0.0
+    for k in keys:
+        va = float(a.get(int(k), 0.0))
+        vb = float(b.get(int(k), 0.0))
+        inter += min(va, vb)
+        union += max(va, vb)
+    if union <= 1e-12:
+        return 0.0
+    return float(inter / union)
+
+
+def _lcs_len(a: Sequence[int], b: Sequence[int]) -> int:
+    na = len(a)
+    nb = len(b)
+    if na == 0 or nb == 0:
+        return 0
+    dp = [[0] * (nb + 1) for _ in range(na + 1)]
+    for i in range(1, na + 1):
+        ai = int(a[i - 1])
+        row = dp[i]
+        prev_row = dp[i - 1]
+        for j in range(1, nb + 1):
+            if ai == int(b[j - 1]):
+                row[j] = prev_row[j - 1] + 1
+            else:
+                row[j] = row[j - 1] if row[j - 1] >= prev_row[j] else prev_row[j]
+    return int(dp[na][nb])
+
+
+def _sparse_seq_similarity(
+    seq_a: Sequence[int],
+    seq_b: Sequence[int],
+    w_a: Dict[int, float],
+    w_b: Dict[int, float],
+    jaccard_mix: float,
+) -> Tuple[float, float, float]:
+    jac = _weighted_jaccard(w_a, w_b)
+    denom = max(len(seq_a), len(seq_b), 1)
+    lcs_n = float(_lcs_len(seq_a, seq_b) / float(denom))
+    a = min(1.0, max(0.0, float(jaccard_mix)))
+    sim = float(a * jac + (1.0 - a) * lcs_n)
+    return sim, jac, lcs_n
+
+
+def build_sparse_sequences_per_sample(
+    samples: Sequence[Sample],
+    per_sample_rows: Sequence[Dict[str, object]],
+    select_mode: str,
+    top_p_mass: float,
+    top_k_ids: int,
+    min_len: int,
+    max_len: int,
+    dedup_consecutive: bool,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    sample_attr_ranked = _build_mid_to_ranked_attr(per_sample_rows)
+    mid_to_w = _build_mid_to_id_weight_map(per_sample_rows)
+    out_rows: List[Dict[str, object]] = []
+    candidates: List[Dict[str, object]] = []
+
+    lo = max(1, int(min_len))
+    hi = int(max_len)
+
+    for s in samples:
+        mid = str(s.mid)
+        ranked = sample_attr_ranked.get(mid, [])
+        if not ranked:
+            continue
+        if str(select_mode) == "top_p_mass":
+            keep_ids = _select_ids_by_top_p(ranked, float(top_p_mass), keep=True)
+        elif str(select_mode) == "top_k_ids":
+            keep_ids = _select_ids_by_top_k(ranked, int(top_k_ids), keep=True)
+        else:
+            raise ValueError(f"unsupported sparse_seq select_mode: {select_mode}")
+        if not keep_ids:
+            continue
+
+        seq = [int(t) for t in s.token_ids if int(t) in keep_ids]
+        if bool(dedup_consecutive):
+            seq = _dedup_consecutive(seq)
+        if hi > 0 and len(seq) > hi:
+            seq = seq[:hi]
+        if len(seq) < lo:
+            continue
+
+        wmap = mid_to_w.get(mid, {})
+        per_id_weight: Dict[int, float] = {}
+        token_weight_mass = 0.0
+        for t in seq:
+            w = float(wmap.get(int(t), 0.0))
+            per_id_weight[int(t)] = max(per_id_weight.get(int(t), 0.0), w)
+            token_weight_mass += w
+        selected_weight_mass = float(sum(float(w) for tid, w in ranked if int(tid) in keep_ids))
+
+        class_name = ""
+        if s.label is not None and 0 <= int(s.label) < len(ar.CLASS_NAMES):
+            class_name = str(ar.CLASS_NAMES[int(s.label)])
+        verb = ""
+        adjective = ""
+        if "__" in class_name:
+            verb, adjective = class_name.split("__", 1)
+
+        rec = {
+            "mid": mid,
+            "class_name": class_name,
+            "verb": verb,
+            "adjective": adjective,
+            "sparse_seq_id_sequence": _motif_to_key(seq),
+            "sparse_seq_len": int(len(seq)),
+            "n_selected_ids": int(len(keep_ids)),
+            "token_weight_mass": float(token_weight_mass),
+            "selected_id_weight_mass": float(selected_weight_mass),
+            "select_mode": str(select_mode),
+            "select_top_p_mass": float(top_p_mass),
+            "select_top_k_ids": int(top_k_ids),
+        }
+        out_rows.append(rec)
+        candidates.append(
+            {
+                "mid": mid,
+                "seq": seq,
+                "per_id_weight": per_id_weight,
+                "token_weight_mass": float(token_weight_mass),
+                "selected_id_weight_mass": float(selected_weight_mass),
+                "class_name": class_name,
+            }
+        )
+    return out_rows, candidates
+
+
+def cluster_sparse_sequences(
+    candidates: Sequence[Dict[str, object]],
+    similarity_threshold: float,
+    jaccard_mix: float,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    n = len(candidates)
+    if n <= 0:
+        return [], []
+    thr = min(1.0, max(0.0, float(similarity_threshold)))
+    sims = np.eye(n, dtype=np.float64)
+    jacs = np.eye(n, dtype=np.float64)
+    lcss = np.eye(n, dtype=np.float64)
+    adj: List[List[int]] = [[] for _ in range(n)]
+
+    for i in range(n):
+        ai = candidates[i]
+        seq_i = ai["seq"]
+        w_i = ai["per_id_weight"]
+        for j in range(i + 1, n):
+            bj = candidates[j]
+            sim, jac, lcs_n = _sparse_seq_similarity(
+                seq_i, bj["seq"], w_i, bj["per_id_weight"], jaccard_mix=float(jaccard_mix)
+            )
+            sims[i, j] = sims[j, i] = sim
+            jacs[i, j] = jacs[j, i] = jac
+            lcss[i, j] = lcss[j, i] = lcs_n
+            if sim >= thr:
+                adj[i].append(j)
+                adj[j].append(i)
+
+    visited = [False] * n
+    clusters: List[List[int]] = []
+    for i in range(n):
+        if visited[i]:
+            continue
+        stack = [i]
+        visited[i] = True
+        comp: List[int] = []
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for v in adj[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    stack.append(v)
+        clusters.append(comp)
+
+    cluster_rows: List[Dict[str, object]] = []
+    cluster_objs: List[Dict[str, object]] = []
+
+    for cid, comp in enumerate(clusters, start=1):
+        if not comp:
+            continue
+        support = len(comp)
+        best_idx = comp[0]
+        best_avg = -1.0
+        for ii in comp:
+            avg = float(np.mean([sims[ii, jj] for jj in comp])) if comp else 0.0
+            if avg > best_avg:
+                best_avg = avg
+                best_idx = ii
+        rep = candidates[best_idx]
+        mids = [str(candidates[ii]["mid"]) for ii in comp]
+        mass_list = [float(candidates[ii]["token_weight_mass"]) for ii in comp]
+        sel_mass_list = [float(candidates[ii]["selected_id_weight_mass"]) for ii in comp]
+
+        sim_vals: List[float] = []
+        jac_vals: List[float] = []
+        lcs_vals: List[float] = []
+        for a in range(len(comp)):
+            for b in range(a + 1, len(comp)):
+                i = comp[a]
+                j = comp[b]
+                sim_vals.append(float(sims[i, j]))
+                jac_vals.append(float(jacs[i, j]))
+                lcs_vals.append(float(lcss[i, j]))
+
+        cluster_rows.append(
+            {
+                "cluster_id": int(cid),
+                "support_samples": int(support),
+                "representative_mid": str(rep["mid"]),
+                "representative_sparse_seq": _motif_to_key(rep["seq"]),
+                "representative_seq_len": int(len(rep["seq"])),
+                "member_mids": " || ".join(mids),
+                "mean_pair_similarity": float(np.mean(sim_vals)) if sim_vals else 1.0,
+                "mean_pair_weighted_jaccard": float(np.mean(jac_vals)) if jac_vals else 1.0,
+                "mean_pair_lcs_similarity": float(np.mean(lcs_vals)) if lcs_vals else 1.0,
+                "representative_avg_similarity": float(best_avg),
+                "mean_token_weight_mass": float(np.mean(mass_list)) if mass_list else float("nan"),
+                "mean_selected_id_weight_mass": float(np.mean(sel_mass_list)) if sel_mass_list else float("nan"),
+            }
+        )
+        cluster_objs.append(
+            {
+                "cluster_id": int(cid),
+                "representative_seq": [int(x) for x in rep["seq"]],
+                "support_samples": int(support),
+                "mean_pair_similarity": float(np.mean(sim_vals)) if sim_vals else 1.0,
+                "mean_pair_weighted_jaccard": float(np.mean(jac_vals)) if jac_vals else 1.0,
+                "mean_pair_lcs_similarity": float(np.mean(lcs_vals)) if lcs_vals else 1.0,
+                "representative_mid": str(rep["mid"]),
+                "mean_token_weight_mass": float(np.mean(mass_list)) if mass_list else float("nan"),
+                "mean_selected_id_weight_mass": float(np.mean(sel_mass_list)) if sel_mass_list else float("nan"),
+            }
+        )
+
+    cluster_rows = sorted(
+        cluster_rows,
+        key=lambda r: (
+            -int(r.get("support_samples", 0)),
+            -float(r.get("mean_token_weight_mass", float("-inf"))),
+            str(r.get("representative_sparse_seq", "")),
+        ),
+    )
+    rank_map: Dict[int, int] = {}
+    for rank, r in enumerate(cluster_rows, start=1):
+        r["rank"] = rank
+        rank_map[int(r["cluster_id"])] = rank
+
+    for obj in cluster_objs:
+        cid = int(obj["cluster_id"])
+        obj["rank"] = int(rank_map.get(cid, 0))
+
+    cluster_objs = sorted(cluster_objs, key=lambda o: int(o.get("rank", 0)))
+    return cluster_rows, cluster_objs
+
+
+def compute_actionrec_sparse_sequence_cluster_perturbation(
+    model: ar.ActionClassifier,
+    samples: Sequence[Sample],
+    vocab_size: int,
+    max_tokens: int,
+    batch_size: int,
+    device: torch.device,
+    n_classes: int,
+    base_metrics: Dict[str, float],
+    clusters: Sequence[Dict[str, object]],
+    top_k_clusters: int,
+    min_gap: int,
+    max_gap: int,
+    drop_all_occurrences: bool,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    ranked = list(clusters)
+    if int(top_k_clusters) > 0:
+        ranked = ranked[: int(top_k_clusters)]
+    for c in ranked:
+        seq = [int(x) for x in c.get("representative_seq", [])]
+        if not seq:
+            continue
+        motifs = [[int(t)] for t in seq]
+        pert_samples, pstats = _perturb_samples_by_global_motif_chain_drop(
+            samples=samples,
+            motifs=motifs,
+            min_gap=int(min_gap),
+            max_gap=int(max_gap),
+            drop_all_occurrences=bool(drop_all_occurrences),
+        )
+        pert_metrics = eval_actionrec_samples(
+            model=model,
+            samples=pert_samples,
+            vocab_size=vocab_size,
+            max_tokens=max_tokens,
+            batch_size=batch_size,
+            device=device,
+            n_classes=n_classes,
+        )
+        delta = _summarize_action_delta(base_metrics, pert_metrics)
+        rows.append(
+            {
+                "rank": int(c.get("rank", 0)),
+                "cluster_id": int(c.get("cluster_id", 0)),
+                "support_samples": int(c.get("support_samples", 0)),
+                "representative_mid": str(c.get("representative_mid", "")),
+                "representative_sparse_seq": _motif_to_key(seq),
+                "representative_seq_len": len(seq),
+                "mean_pair_similarity": float(c.get("mean_pair_similarity", float("nan"))),
+                "mean_pair_weighted_jaccard": float(c.get("mean_pair_weighted_jaccard", float("nan"))),
+                "mean_pair_lcs_similarity": float(c.get("mean_pair_lcs_similarity", float("nan"))),
+                "perturbation": "drop_sparse_id_chain_global",
+                "drop_all_occurrences": int(bool(drop_all_occurrences)),
+                "chain_min_gap": int(min_gap),
+                "chain_max_gap": int(max_gap),
+                "importance_score": float(delta["primary_metric_drop"]),
+                **delta,
+                **pstats,
+            }
+        )
+    return rows
+
+
+def compute_retrieval_sparse_sequence_cluster_perturbation(
+    model: rt.DualEncoder,
+    samples: Sequence[Sample],
+    motiongpt_root: str,
+    vocab_size: int,
+    max_tokens: int,
+    max_text_len: int,
+    batch_size: int,
+    device: torch.device,
+    base_metrics: Dict[str, object],
+    cached_text_emb: np.ndarray,
+    clusters: Sequence[Dict[str, object]],
+    top_k_clusters: int,
+    min_gap: int,
+    max_gap: int,
+    drop_all_occurrences: bool,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    ranked = list(clusters)
+    if int(top_k_clusters) > 0:
+        ranked = ranked[: int(top_k_clusters)]
+    for c in ranked:
+        seq = [int(x) for x in c.get("representative_seq", [])]
+        if not seq:
+            continue
+        motifs = [[int(t)] for t in seq]
+        pert_samples, pstats = _perturb_samples_by_global_motif_chain_drop(
+            samples=samples,
+            motifs=motifs,
+            min_gap=int(min_gap),
+            max_gap=int(max_gap),
+            drop_all_occurrences=bool(drop_all_occurrences),
+        )
+        pert_metrics = evaluate_retrieval(
+            model=model,
+            samples=pert_samples,
+            motiongpt_root=motiongpt_root,
+            vocab_size=vocab_size,
+            max_tokens=max_tokens,
+            max_text_len=max_text_len,
+            batch_size=batch_size,
+            device=device,
+            cached_text_emb=cached_text_emb,
+        )
+        delta = _summarize_retrieval_delta(base_metrics, pert_metrics)
+        rows.append(
+            {
+                "rank": int(c.get("rank", 0)),
+                "cluster_id": int(c.get("cluster_id", 0)),
+                "support_samples": int(c.get("support_samples", 0)),
+                "representative_mid": str(c.get("representative_mid", "")),
+                "representative_sparse_seq": _motif_to_key(seq),
+                "representative_seq_len": len(seq),
+                "mean_pair_similarity": float(c.get("mean_pair_similarity", float("nan"))),
+                "mean_pair_weighted_jaccard": float(c.get("mean_pair_weighted_jaccard", float("nan"))),
+                "mean_pair_lcs_similarity": float(c.get("mean_pair_lcs_similarity", float("nan"))),
+                "perturbation": "drop_sparse_id_chain_global",
+                "drop_all_occurrences": int(bool(drop_all_occurrences)),
+                "chain_min_gap": int(min_gap),
+                "chain_max_gap": int(max_gap),
+                "importance_score": float(delta["primary_metric_drop"]),
+                **delta,
+                **pstats,
+            }
+        )
+    return rows
+
+
 def _motif_to_key(motif: Sequence[int]) -> str:
     return " ".join(str(int(t)) for t in motif)
 
@@ -2556,6 +2962,21 @@ def main() -> None:
     ap.add_argument("--motif_chain_max_gap", type=int, default=8)
     ap.add_argument("--motif_chain_min_delta", type=float, default=0.0,
                     help="Minimum incremental primary_metric_drop gain to keep greedy chain expansion.")
+    ap.add_argument("--sparse_seq_enable", type=int, default=1, choices=[0, 1])
+    ap.add_argument("--sparse_seq_select_mode", type=str, default="top_p_mass", choices=["top_p_mass", "top_k_ids"])
+    ap.add_argument("--sparse_seq_top_p_mass", type=float, default=0.3)
+    ap.add_argument("--sparse_seq_top_k_ids", type=int, default=5)
+    ap.add_argument("--sparse_seq_min_len", type=int, default=2)
+    ap.add_argument("--sparse_seq_max_len", type=int, default=12,
+                    help="<=0 means no max length limit.")
+    ap.add_argument("--sparse_seq_dedup_consecutive", type=int, default=1, choices=[0, 1])
+    ap.add_argument("--sparse_seq_similarity_threshold", type=float, default=0.65)
+    ap.add_argument("--sparse_seq_similarity_jaccard_mix", type=float, default=0.5,
+                    help="Similarity = a*weighted_jaccard + (1-a)*normalized_lcs")
+    ap.add_argument("--sparse_seq_cluster_top_k", type=int, default=50)
+    ap.add_argument("--sparse_seq_chain_min_gap", type=int, default=0)
+    ap.add_argument("--sparse_seq_chain_max_gap", type=int, default=16)
+    ap.add_argument("--sparse_seq_drop_all_occurrences", type=int, default=1, choices=[0, 1])
 
     args = ap.parse_args()
     out_dir = Path(args.out_dir)
@@ -2594,6 +3015,9 @@ def main() -> None:
     motif_set_perturb_rows: List[Dict[str, object]] = []
     motif_chain_perturb_rows: List[Dict[str, object]] = []
     motif_summary_rows: List[Dict[str, object]] = []
+    sparse_seq_per_sample_rows: List[Dict[str, object]] = []
+    sparse_seq_cluster_rows: List[Dict[str, object]] = []
+    sparse_seq_cluster_perturb_rows: List[Dict[str, object]] = []
     motif_score_target_used = ""
     base_metrics: Dict[str, object]
 
@@ -2629,6 +3053,37 @@ def main() -> None:
             class_names=class_names,
         )
         attr_coverage_per_sample_rows, attr_coverage_summary_rows = compute_attr_coverage_rows(attr_sample_rows)
+        if int(args.sparse_seq_enable) == 1:
+            sparse_seq_per_sample_rows, sparse_candidates = build_sparse_sequences_per_sample(
+                samples=run_samples,
+                per_sample_rows=attr_sample_rows,
+                select_mode=str(args.sparse_seq_select_mode),
+                top_p_mass=float(args.sparse_seq_top_p_mass),
+                top_k_ids=int(args.sparse_seq_top_k_ids),
+                min_len=int(args.sparse_seq_min_len),
+                max_len=int(args.sparse_seq_max_len),
+                dedup_consecutive=bool(int(args.sparse_seq_dedup_consecutive)),
+            )
+            sparse_seq_cluster_rows, sparse_clusters = cluster_sparse_sequences(
+                candidates=sparse_candidates,
+                similarity_threshold=float(args.sparse_seq_similarity_threshold),
+                jaccard_mix=float(args.sparse_seq_similarity_jaccard_mix),
+            )
+            sparse_seq_cluster_perturb_rows = compute_actionrec_sparse_sequence_cluster_perturbation(
+                model=model,
+                samples=run_samples,
+                vocab_size=args.vocab_size,
+                max_tokens=args.max_tokens,
+                batch_size=args.batch_size,
+                device=device,
+                n_classes=n_classes,
+                base_metrics=base,
+                clusters=sparse_clusters,
+                top_k_clusters=int(args.sparse_seq_cluster_top_k),
+                min_gap=int(args.sparse_seq_chain_min_gap),
+                max_gap=int(args.sparse_seq_chain_max_gap),
+                drop_all_occurrences=bool(int(args.sparse_seq_drop_all_occurrences)),
+            )
         if str(args.motif_mining_method) == "frequent_contiguous":
             motif_candidates = mine_frequent_contiguous_motifs(
                 samples=run_samples,
@@ -2807,6 +3262,39 @@ def main() -> None:
             class_names=class_names,
         )
         attr_coverage_per_sample_rows, attr_coverage_summary_rows = compute_attr_coverage_rows(attr_sample_rows)
+        if int(args.sparse_seq_enable) == 1:
+            sparse_seq_per_sample_rows, sparse_candidates = build_sparse_sequences_per_sample(
+                samples=run_samples,
+                per_sample_rows=attr_sample_rows,
+                select_mode=str(args.sparse_seq_select_mode),
+                top_p_mass=float(args.sparse_seq_top_p_mass),
+                top_k_ids=int(args.sparse_seq_top_k_ids),
+                min_len=int(args.sparse_seq_min_len),
+                max_len=int(args.sparse_seq_max_len),
+                dedup_consecutive=bool(int(args.sparse_seq_dedup_consecutive)),
+            )
+            sparse_seq_cluster_rows, sparse_clusters = cluster_sparse_sequences(
+                candidates=sparse_candidates,
+                similarity_threshold=float(args.sparse_seq_similarity_threshold),
+                jaccard_mix=float(args.sparse_seq_similarity_jaccard_mix),
+            )
+            sparse_seq_cluster_perturb_rows = compute_retrieval_sparse_sequence_cluster_perturbation(
+                model=model,
+                samples=run_samples,
+                motiongpt_root=args.motiongpt_root,
+                vocab_size=args.vocab_size,
+                max_tokens=args.max_tokens,
+                max_text_len=args.max_text_len,
+                batch_size=args.batch_size,
+                device=device,
+                base_metrics=base,
+                cached_text_emb=text_emb,
+                clusters=sparse_clusters,
+                top_k_clusters=int(args.sparse_seq_cluster_top_k),
+                min_gap=int(args.sparse_seq_chain_min_gap),
+                max_gap=int(args.sparse_seq_chain_max_gap),
+                drop_all_occurrences=bool(int(args.sparse_seq_drop_all_occurrences)),
+            )
         if str(args.motif_mining_method) == "frequent_contiguous":
             motif_candidates = mine_frequent_contiguous_motifs(
                 samples=run_samples,
@@ -2968,6 +3456,9 @@ def main() -> None:
     write_csv(out_dir / "id_budget_curves.csv", budget_curve_rows)
     write_csv(out_dir / "id_attr_coverage_per_sample.csv", attr_coverage_per_sample_rows)
     write_csv(out_dir / "id_attr_coverage_summary.csv", attr_coverage_summary_rows)
+    write_csv(out_dir / "id_sparse_sequences_per_sample.csv", sparse_seq_per_sample_rows)
+    write_csv(out_dir / "id_sparse_sequence_clusters.csv", sparse_seq_cluster_rows)
+    write_csv(out_dir / "id_sparse_sequence_cluster_perturbation.csv", sparse_seq_cluster_perturb_rows)
     write_csv(out_dir / "id_sequence_motifs_per_sample.csv", motif_per_sample_rows)
     write_csv(out_dir / "id_sequence_motif_perturbation_per_sample.csv", motif_perturb_per_sample_rows)
     write_csv(out_dir / "id_sequence_motif_perturbation.csv", motif_perturb_global_rows)
@@ -3010,6 +3501,19 @@ def main() -> None:
         "motif_chain_min_gap": int(args.motif_chain_min_gap),
         "motif_chain_max_gap": int(args.motif_chain_max_gap),
         "motif_chain_min_delta": float(args.motif_chain_min_delta),
+        "sparse_seq_enable": int(args.sparse_seq_enable),
+        "sparse_seq_select_mode": str(args.sparse_seq_select_mode),
+        "sparse_seq_top_p_mass": float(args.sparse_seq_top_p_mass),
+        "sparse_seq_top_k_ids": int(args.sparse_seq_top_k_ids),
+        "sparse_seq_min_len": int(args.sparse_seq_min_len),
+        "sparse_seq_max_len": int(args.sparse_seq_max_len),
+        "sparse_seq_dedup_consecutive": int(args.sparse_seq_dedup_consecutive),
+        "sparse_seq_similarity_threshold": float(args.sparse_seq_similarity_threshold),
+        "sparse_seq_similarity_jaccard_mix": float(args.sparse_seq_similarity_jaccard_mix),
+        "sparse_seq_cluster_top_k": int(args.sparse_seq_cluster_top_k),
+        "sparse_seq_chain_min_gap": int(args.sparse_seq_chain_min_gap),
+        "sparse_seq_chain_max_gap": int(args.sparse_seq_chain_max_gap),
+        "sparse_seq_drop_all_occurrences": int(args.sparse_seq_drop_all_occurrences),
         "n_samples_all": len(all_samples),
         "n_samples_labeled": len(labeled_samples),
         "n_samples_eval": len(run_samples),
@@ -3029,6 +3533,9 @@ def main() -> None:
             "id_budget_curves": str(out_dir / "id_budget_curves.csv"),
             "id_attr_coverage_per_sample": str(out_dir / "id_attr_coverage_per_sample.csv"),
             "id_attr_coverage_summary": str(out_dir / "id_attr_coverage_summary.csv"),
+            "id_sparse_sequences_per_sample": str(out_dir / "id_sparse_sequences_per_sample.csv"),
+            "id_sparse_sequence_clusters": str(out_dir / "id_sparse_sequence_clusters.csv"),
+            "id_sparse_sequence_cluster_perturbation": str(out_dir / "id_sparse_sequence_cluster_perturbation.csv"),
             "id_sequence_motifs_per_sample": str(out_dir / "id_sequence_motifs_per_sample.csv"),
             "id_sequence_motif_perturbation": str(out_dir / "id_sequence_motif_perturbation.csv"),
             "id_sequence_motif_perturbation_per_sample": str(out_dir / "id_sequence_motif_perturbation_per_sample.csv"),

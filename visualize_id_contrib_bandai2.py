@@ -59,9 +59,15 @@ def load_all_data(
     Dict[str, Dict[str, List[Dict[str, str]]]],
     Dict[str, Dict[str, List[Dict[str, str]]]],
     Dict[str, Dict[str, List[Dict[str, str]]]],
+    Dict[str, Dict[str, List[Dict[str, str]]]],
+    Dict[str, Dict[str, List[Dict[str, str]]]],
+    Dict[str, Dict[str, List[Dict[str, str]]]],
 ]:
     summaries: Dict[str, Dict[str, Dict[str, object]]] = {"actionrec": {}, "retrieval": {}}
     perturb_rows: Dict[str, Dict[str, List[Dict[str, str]]]] = {"actionrec": {}, "retrieval": {}}
+    motif_perturb_rows: Dict[str, Dict[str, List[Dict[str, str]]]] = {"actionrec": {}, "retrieval": {}}
+    motif_set_perturb_rows: Dict[str, Dict[str, List[Dict[str, str]]]] = {"actionrec": {}, "retrieval": {}}
+    motif_chain_perturb_rows: Dict[str, Dict[str, List[Dict[str, str]]]] = {"actionrec": {}, "retrieval": {}}
     class_rows: Dict[str, Dict[str, List[Dict[str, str]]]] = {"actionrec": {}, "retrieval": {}}
     type_class_rows: Dict[str, Dict[str, List[Dict[str, str]]]] = {"actionrec": {}, "retrieval": {}}
     attr_rows: Dict[str, Dict[str, List[Dict[str, str]]]] = {"actionrec": {}, "retrieval": {}}
@@ -79,6 +85,12 @@ def load_all_data(
             summaries[task][name] = _load_json(summary_path)
             perturb_path = d / "id_perturbation.csv"
             perturb_rows[task][name] = _load_csv_rows(perturb_path) if perturb_path.exists() else []
+            motif_perturb_path = d / "id_sequence_motif_perturbation.csv"
+            motif_perturb_rows[task][name] = _load_csv_rows(motif_perturb_path) if motif_perturb_path.exists() else []
+            motif_set_perturb_path = d / "id_sequence_motif_set_perturbation.csv"
+            motif_set_perturb_rows[task][name] = _load_csv_rows(motif_set_perturb_path) if motif_set_perturb_path.exists() else []
+            motif_chain_perturb_path = d / "id_sequence_motif_chain_perturbation.csv"
+            motif_chain_perturb_rows[task][name] = _load_csv_rows(motif_chain_perturb_path) if motif_chain_perturb_path.exists() else []
             class_rows[task][name] = _load_csv_rows(class_path)
             type_class_rows[task][name] = _load_csv_rows(type_class_path)
             attr_dir = base_dir / f"{task}2_{name}" / (attr_suffix if str(attr_suffix).strip() else out_suffix)
@@ -88,7 +100,7 @@ def load_all_data(
             attr_sample_path = attr_dir / "id_attribution_per_sample.csv"
             if attr_sample_path.exists():
                 attr_sample_rows[task][name] = _load_csv_rows(attr_sample_path)
-    return summaries, perturb_rows, class_rows, type_class_rows, attr_rows, attr_sample_rows
+    return summaries, perturb_rows, motif_perturb_rows, motif_set_perturb_rows, motif_chain_perturb_rows, class_rows, type_class_rows, attr_rows, attr_sample_rows
 
 
 def plot_base_metrics(
@@ -677,6 +689,258 @@ def plot_top_id_importance_per_model(
 
     if not HAS_MATPLOTLIB:
         print(f"[warn] matplotlib not found: skip top-id bar plots ({task})")
+    return merged_rows
+
+
+def _top_motif_rows_for_model(rows: List[Dict[str, str]], top_k: int) -> List[Dict[str, object]]:
+    grouped: Dict[str, Dict[str, object]] = {}
+    for r in rows:
+        motif_key = str(r.get("motif_key", r.get("motif_id_sequence", ""))).strip()
+        if not motif_key:
+            continue
+        rec = grouped.setdefault(
+            motif_key,
+            {
+                "motif_key": motif_key,
+                "motif_id_sequence": str(r.get("motif_id_sequence", motif_key)),
+                "motif_len": int(_to_float(r.get("motif_len"), 0.0)),
+                "importance_vals": [],
+                "removed_token_ratios": [],
+                "support_samples": 0.0,
+                "matched_occurrences": 0.0,
+            },
+        )
+        importance = _to_float(r.get("importance_score"), float("nan"))
+        if math.isnan(importance):
+            importance = _to_float(r.get("primary_metric_drop"), _to_float(r.get("sample_score_drop"), float("nan")))
+        if not math.isnan(importance):
+            rec["importance_vals"].append(float(importance))
+        rr = _to_float(r.get("removed_token_ratio"), float("nan"))
+        if not math.isnan(rr):
+            rec["removed_token_ratios"].append(float(rr))
+        rec["support_samples"] = max(float(rec["support_samples"]), _to_float(r.get("support_samples"), 0.0))
+        rec["matched_occurrences"] = max(float(rec["matched_occurrences"]), _to_float(r.get("total_matched_occurrences"), _to_float(r.get("matched_occurrences"), 0.0)))
+
+    collapsed: List[Dict[str, object]] = []
+    for _k, rec in grouped.items():
+        vals = list(rec["importance_vals"])
+        collapsed.append(
+            {
+                "motif_key": str(rec["motif_key"]),
+                "motif_id_sequence": str(rec["motif_id_sequence"]),
+                "motif_len": int(rec["motif_len"]),
+                "importance_score": float(sum(vals) / len(vals)) if vals else float("nan"),
+                "removed_token_ratio": float(sum(rec["removed_token_ratios"]) / len(rec["removed_token_ratios"])) if rec["removed_token_ratios"] else float("nan"),
+                "support_samples": int(rec["support_samples"]),
+                "matched_occurrences": int(rec["matched_occurrences"]),
+            }
+        )
+
+    picked = sorted(
+        collapsed,
+        key=lambda r: (
+            -_to_float(r.get("importance_score"), float("-inf")),
+            -_to_float(r.get("support_samples"), 0.0),
+            -_to_float(r.get("matched_occurrences"), 0.0),
+            str(r.get("motif_key", "")),
+        ),
+    )[: max(1, int(top_k))]
+    out: List[Dict[str, object]] = []
+    for i, r in enumerate(picked, start=1):
+        out.append({"rank": i, **r})
+    return out
+
+
+def plot_top_motif_importance_per_model(
+    task: str,
+    rows_by_model: Dict[str, List[Dict[str, str]]],
+    names: List[str],
+    top_k: int,
+    out_dir: Path,
+) -> List[Dict[str, object]]:
+    merged_rows: List[Dict[str, object]] = []
+    models = [n for n in names if n in rows_by_model]
+    if not models:
+        print(f"[warn] no rows for top-motif importance: task={task}")
+        return merged_rows
+
+    for model in models:
+        top_rows = _top_motif_rows_for_model(rows_by_model[model], top_k)
+        for r in top_rows:
+            rr = dict(r)
+            rr["task"] = task
+            rr["tokenizer"] = model
+            merged_rows.append(rr)
+
+        if not HAS_MATPLOTLIB:
+            continue
+        fig_h = max(4.5, 0.28 * len(top_rows) + 1.8)
+        fig, ax = plt.subplots(1, 1, figsize=(10.0, fig_h), constrained_layout=True)
+        labels = [
+            f"L{int(r['motif_len'])} | {str(r['motif_id_sequence'])[:48]}" + ("..." if len(str(r["motif_id_sequence"])) > 48 else "")
+            for r in top_rows
+        ]
+        values = [float(r["importance_score"]) for r in top_rows]
+        ypos = list(range(len(top_rows)))
+        ax.barh(ypos, values)
+        ax.set_yticks(ypos)
+        ax.set_yticklabels(labels)
+        ax.invert_yaxis()
+        ax.set_xlabel("importance_score (sample_score_drop)")
+        ax.set_ylabel("motif (length | prefix)")
+        ax.set_title(f"{task} | {model} | top-{len(top_rows)} importance motifs")
+        ax.grid(axis="x", alpha=0.25)
+        fig.savefig(out_dir / f"{task}_{_sanitize_name(model)}_top_motif_importance.png", dpi=180)
+        plt.close(fig)
+
+    if not HAS_MATPLOTLIB:
+        print(f"[warn] matplotlib not found: skip top-motif bar plots ({task})")
+    return merged_rows
+
+
+def plot_motif_set_perturbation_curves(
+    task: str,
+    rows_by_model: Dict[str, List[Dict[str, str]]],
+    names: List[str],
+    out_dir: Path,
+) -> List[Dict[str, object]]:
+    merged_rows: List[Dict[str, object]] = []
+    models = [n for n in names if n in rows_by_model]
+    if not models:
+        print(f"[warn] no rows for motif-set perturbation curves: task={task}")
+        return merged_rows
+
+    series: Dict[str, List[Tuple[int, float]]] = {}
+    base_by_model: Dict[str, float] = {}
+    for model in models:
+        rows = rows_by_model.get(model, [])
+        pts: List[Tuple[int, float]] = []
+        base_val = float("nan")
+        for r in rows:
+            k = int(_to_float(r.get("set_size_k"), 0.0))
+            base_r = _to_float(r.get("base_primary_metric"), float("nan"))
+            pert = _to_float(r.get("perturbed_primary_metric"), float("nan"))
+            drop = _to_float(r.get("importance_score"), _to_float(r.get("primary_metric_drop"), float("nan")))
+            if math.isnan(base_val) and not math.isnan(base_r):
+                base_val = base_r
+            if math.isnan(pert) and (not math.isnan(base_r)) and (not math.isnan(drop)):
+                pert = base_r - drop
+            v = pert
+            if k <= 0 or math.isnan(v):
+                continue
+            pts.append((k, v))
+        # Keep raw CSV rows (no per-k overwrite) so plotted values match source CSV.
+        curve = sorted(pts, key=lambda x: x[0])
+        if not math.isnan(base_val):
+            curve = [(0, base_val)] + curve
+        base_by_model[model] = base_val
+        series[model] = curve
+        for k, v in curve:
+            merged_rows.append(
+                {
+                    "task": task,
+                    "tokenizer": model,
+                    "set_size_k": k,
+                    "primary_metric": v,
+                    "primary_metric_drop_from_base": (base_val - v) if not math.isnan(base_val) else float("nan"),
+                }
+            )
+
+    if not HAS_MATPLOTLIB:
+        print(f"[warn] matplotlib not found: skip motif-set perturbation curves ({task})")
+        return merged_rows
+
+    fig, ax = plt.subplots(1, 1, figsize=(8.6, 5.6), constrained_layout=True)
+    plotted = False
+    for model in models:
+        curve = series.get(model, [])
+        if not curve:
+            continue
+        xs = [k for k, _v in curve]
+        ys = [v for _k, v in curve]
+        ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=4.5, label=model)
+        plotted = True
+    if not plotted:
+        plt.close(fig)
+        return merged_rows
+
+    ax.set_xlabel("set_size_k (number of motifs dropped together)")
+    ax.set_ylabel("primary_metric (k=0 is no-drop baseline)")
+    ax.set_title(f"{task} | motif-set perturbation (primary_metric vs k)")
+    ax.set_xscale("symlog", linthresh=1.0)
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.savefig(out_dir / f"{task}_motif_set_perturbation_curve.png", dpi=180)
+    plt.close(fig)
+    return merged_rows
+
+
+def plot_motif_chain_perturbation_curves(
+    task: str,
+    rows_by_model: Dict[str, List[Dict[str, str]]],
+    names: List[str],
+    out_dir: Path,
+) -> List[Dict[str, object]]:
+    merged_rows: List[Dict[str, object]] = []
+    models = [n for n in names if n in rows_by_model]
+    if not models:
+        print(f"[warn] no rows for motif-chain perturbation curves: task={task}")
+        return merged_rows
+
+    series: Dict[str, List[Tuple[int, float]]] = {}
+    for model in models:
+        rows = rows_by_model.get(model, [])
+        pts: List[Tuple[int, float]] = []
+        base_val = float("nan")
+        for r in rows:
+            step = int(_to_float(r.get("chain_step"), 0.0))
+            base_r = _to_float(r.get("base_primary_metric"), float("nan"))
+            pert = _to_float(r.get("perturbed_primary_metric"), float("nan"))
+            if math.isnan(base_val) and not math.isnan(base_r):
+                base_val = base_r
+            if step <= 0 or math.isnan(pert):
+                continue
+            pts.append((step, pert))
+        curve = sorted(pts, key=lambda x: x[0])
+        if not math.isnan(base_val):
+            curve = [(0, base_val)] + curve
+        series[model] = curve
+        for step, v in curve:
+            merged_rows.append(
+                {
+                    "task": task,
+                    "tokenizer": model,
+                    "chain_step": step,
+                    "primary_metric": v,
+                    "primary_metric_drop_from_base": (base_val - v) if not math.isnan(base_val) else float("nan"),
+                }
+            )
+
+    if not HAS_MATPLOTLIB:
+        print(f"[warn] matplotlib not found: skip motif-chain perturbation curves ({task})")
+        return merged_rows
+
+    fig, ax = plt.subplots(1, 1, figsize=(8.6, 5.6), constrained_layout=True)
+    plotted = False
+    for model in models:
+        curve = series.get(model, [])
+        if not curve:
+            continue
+        xs = [step for step, _v in curve]
+        ys = [v for _step, v in curve]
+        ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=4.5, label=model)
+        plotted = True
+    if not plotted:
+        plt.close(fig)
+        return merged_rows
+
+    ax.set_xlabel("chain_step (number of motifs in greedy chain)")
+    ax.set_ylabel("primary_metric (step=0 is no-drop baseline)")
+    ax.set_title(f"{task} | motif-chain perturbation (primary_metric vs chain_step)")
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.savefig(out_dir / f"{task}_motif_chain_perturbation_curve.png", dpi=180)
+    plt.close(fig)
     return merged_rows
 
 
@@ -2467,6 +2731,7 @@ def main() -> None:
     ap.add_argument("--out_dir", type=str, default="experiments/bandai/id_contrib_viz")
     ap.add_argument("--names", type=str, nargs="+", default=DEFAULT_NAMES)
     ap.add_argument("--top_k_ids", type=int, default=20)
+    ap.add_argument("--top_k_motifs", type=int, default=20)
     ap.add_argument("--top_k_ids_per_class", type=int, default=5)
     ap.add_argument("--top_k_classes", type=int, default=20)
     ap.add_argument(
@@ -2498,7 +2763,7 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    summaries, perturb_rows, class_rows, type_class_rows, attr_rows, attr_sample_rows = load_all_data(
+    summaries, perturb_rows, motif_perturb_rows, motif_set_perturb_rows, motif_chain_perturb_rows, class_rows, type_class_rows, attr_rows, attr_sample_rows = load_all_data(
         base_dir,
         args.out_suffix,
         args.attr_suffix,
@@ -2523,6 +2788,50 @@ def main() -> None:
     )
     write_csv(out_dir / "actionrec_top_id_importance_per_model.csv", action_top_rows)
     write_csv(out_dir / "retrieval_top_id_importance_per_model.csv", retrieval_top_rows)
+    action_top_motif_rows = plot_top_motif_importance_per_model(
+        "actionrec",
+        motif_perturb_rows["actionrec"],
+        args.names,
+        args.top_k_motifs,
+        out_dir,
+    )
+    retrieval_top_motif_rows = plot_top_motif_importance_per_model(
+        "retrieval",
+        motif_perturb_rows["retrieval"],
+        args.names,
+        args.top_k_motifs,
+        out_dir,
+    )
+    write_csv(out_dir / "actionrec_top_motif_importance_per_model.csv", action_top_motif_rows)
+    write_csv(out_dir / "retrieval_top_motif_importance_per_model.csv", retrieval_top_motif_rows)
+    action_motif_set_curve_rows = plot_motif_set_perturbation_curves(
+        "actionrec",
+        motif_set_perturb_rows["actionrec"],
+        args.names,
+        out_dir,
+    )
+    retrieval_motif_set_curve_rows = plot_motif_set_perturbation_curves(
+        "retrieval",
+        motif_set_perturb_rows["retrieval"],
+        args.names,
+        out_dir,
+    )
+    write_csv(out_dir / "actionrec_motif_set_perturbation_curve_per_model.csv", action_motif_set_curve_rows)
+    write_csv(out_dir / "retrieval_motif_set_perturbation_curve_per_model.csv", retrieval_motif_set_curve_rows)
+    action_motif_chain_curve_rows = plot_motif_chain_perturbation_curves(
+        "actionrec",
+        motif_chain_perturb_rows["actionrec"],
+        args.names,
+        out_dir,
+    )
+    retrieval_motif_chain_curve_rows = plot_motif_chain_perturbation_curves(
+        "retrieval",
+        motif_chain_perturb_rows["retrieval"],
+        args.names,
+        out_dir,
+    )
+    write_csv(out_dir / "actionrec_motif_chain_perturbation_curve_per_model.csv", action_motif_chain_curve_rows)
+    write_csv(out_dir / "retrieval_motif_chain_perturbation_curve_per_model.csv", retrieval_motif_chain_curve_rows)
 
     action_assoc_rows = export_class_id_association_per_model(
         "actionrec",

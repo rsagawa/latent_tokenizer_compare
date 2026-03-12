@@ -35,3 +35,7 @@ python3 visualize_id_contrib_bandai2.py \
 
 
 python3 ./make_id_contrib_dashboard.py
+
+python3 visualize_sparse_id_sequences.py \
+  --id_contrib_dir experiments/bandai/actionrec2_latent_tokenizer/id_contrib_test \
+  --top_k_clusters 25
